@@ -143,9 +143,9 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>ad-hoc</string>
+            <string>release-testing</string>
             <key>signingStyle</key>
-            <string>manual</string>
+            <string>automatic</string>
             <key>compileBitcode</key>
             <false/>
             <key>stripSwiftSymbols</key>
@@ -155,56 +155,62 @@ jobs:
             <key>thinning</key>
             <string>&lt;none&gt;</string>
             <key>teamID</key>
-            <string></string>
-            <key>signingCertificate</key>
-            <string>-</string>
-            <key>provisioningProfiles</key>
-            <dict/>
+            <string>NOTAREALTEAM</string>
             <key>iCloudContainerEnvironment</key>
             <string>Production</string>
           </dict>
           </plist>
           EOF
 
-      # Step 11: Export unsigned IPA
-      - name: Export IPA
+      # Step 11: Extract and create unsigned IPA manually
+      - name: Create unsigned IPA
         run: |
           set -o pipefail
           
-          echo "📦 Starting IPA export..."
+          echo "📦 Creating unsigned IPA from archive..."
           
-          # Try export with explicit unsigned parameters
-          xcodebuild -exportArchive \
-            -archivePath "${{ env.BUILD_PATH }}/BitChat.xcarchive" \
-            -exportPath "${{ env.BUILD_PATH }}/ipa" \
-            -exportOptionsPlist "${{ env.BUILD_PATH }}/ExportOptions.plist" \
-            -allowProvisioningUpdates \
-            CODE_SIGN_IDENTITY="" \
-            PROVISIONING_PROFILE="" \
-            DEVELOPMENT_TEAM="" \
-            | xcpretty || {
-            echo "❌ Export with xcpretty failed, trying without xcpretty for detailed output..."
-            xcodebuild -exportArchive \
-              -archivePath "${{ env.BUILD_PATH }}/BitChat.xcarchive" \
-              -exportPath "${{ env.BUILD_PATH }}/ipa" \
-              -exportOptionsPlist "${{ env.BUILD_PATH }}/ExportOptions.plist" \
-              -allowProvisioningUpdates \
-              CODE_SIGN_IDENTITY="" \
-              PROVISIONING_PROFILE="" \
-              DEVELOPMENT_TEAM=""
-          }
+          # Create IPA structure
+          mkdir -p "${{ env.BUILD_PATH }}/ipa/Payload"
+          
+          # Find the .app bundle in the archive
+          APP_PATH=$(find "${{ env.BUILD_PATH }}/BitChat.xcarchive/Products" -name "*.app" -type d | head -n 1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Error: No .app bundle found in archive"
+            echo "📁 Archive contents:"
+            find "${{ env.BUILD_PATH }}/BitChat.xcarchive" -type f -o -type d | head -20
+            exit 1
+          fi
+          
+          echo "✅ Found app bundle: $APP_PATH"
+          
+          # Copy app bundle to Payload directory
+          cp -R "$APP_PATH" "${{ env.BUILD_PATH }}/ipa/Payload/"
+          
+          # Get app name for IPA filename
+          APP_NAME=$(basename "$APP_PATH" .app)
+          
+          # Remove any existing code signatures to make it truly unsigned
+          echo "🔓 Removing existing code signatures..."
+          find "${{ env.BUILD_PATH }}/ipa/Payload/$APP_NAME.app" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "${{ env.BUILD_PATH }}/ipa/Payload/$APP_NAME.app" -name "*.mobileprovision" -delete 2>/dev/null || true
+          
+          # Create the IPA (zip file)
+          echo "📁 Creating IPA archive..."
+          cd "${{ env.BUILD_PATH }}/ipa"
+          zip -r "../${APP_NAME}.ipa" Payload/ -q
           
           # Verify IPA was created
-          if [ -f "${{ env.BUILD_PATH }}/ipa"/*.ipa ]; then
-            echo "✅ IPA export completed successfully"
-            ls -la "${{ env.BUILD_PATH }}/ipa"/*.ipa
-          else
-            echo "❌ Error: IPA file not found"
-            echo "📁 Contents of export directory:"
-            ls -la "${{ env.BUILD_PATH }}/ipa/" || echo "Export directory doesn't exist"
+          if [ -f "${{ env.BUILD_PATH }}/${APP_NAME}.ipa" ]; then
+            echo "✅ Unsigned IPA created successfully"
+            ls -la "${{ env.BUILD_PATH }}/${APP_NAME}.ipa"
             
-            echo "📋 Export logs location (if any):"
-            find /var/folders -name "*.xcdistributionlogs" 2>/dev/null | head -5 || echo "No distribution logs found"
+            # Show IPA contents for verification
+            echo "📋 IPA contents:"
+            unzip -l "${{ env.BUILD_PATH }}/${APP_NAME}.ipa" | head -10
+          else
+            echo "❌ Error: IPA file not created"
+            ls -la "${{ env.BUILD_PATH }}/"
             exit 1
           fi
 
@@ -235,7 +241,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.build_info.outputs.artifact_name }}
-          path: ${{ env.BUILD_PATH }}/ipa/*.ipa
+          path: ${{ env.BUILD_PATH }}/*.ipa
           retention-days: 30
           if-no-files-found: error
 
