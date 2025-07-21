@@ -24,15 +24,16 @@ jobs:
       - name: Setup project (run just)
         run: just
 
-      - name: Build macOS app
-        run: |
-          xcodebuild \
-            -project bitchat.xcodeproj \
-            -scheme "bitchat (macOS)" \
-            -configuration Release \
-            -destination 'platform=macOS' \
-            build \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+     - name: Build macOS BitChat app
+          run: |
+              xcodebuild \
+              -project bitchat.xcodeproj \
+              -scheme "bitchat (macOS)" \
+              -configuration Release \
+              -destination 'platform=macOS' \
+              build \
+              CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+
 
       - name: Archive .app
         run: |
