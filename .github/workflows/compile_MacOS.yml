@@ -18,17 +18,15 @@ jobs:
         run: |
           which brew || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Generate Xcode project
+      - name: Install dependencies
         run: |
-          cd bitchat
-          xcodegen generate
+          brew install xcodegen just
+
+      - name: Run just setup
+        run: just
 
       - name: Build BitChat macOS App
         run: |
-          cd bitchat
           xcodebuild \
             -project bitchat.xcodeproj \
             -scheme bitchat \
@@ -40,7 +38,7 @@ jobs:
       - name: Archive .app bundle
         run: |
           mkdir -p output
-          cp -R bitchat/build/Release/BitChat.app output/
+          cp -R build/Release/BitChat.app output/ || cp -R bitchat/build/Release/BitChat.app output/
 
       - name: Upload .app artifact
         uses: actions/upload-artifact@v4
