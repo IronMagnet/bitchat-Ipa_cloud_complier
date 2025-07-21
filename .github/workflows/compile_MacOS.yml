@@ -7,14 +7,13 @@ on:
 
 jobs:
   build:
-    name: Build macOS App
     runs-on: macos-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Homebrew
+      - name: Install Homebrew (if needed)
         run: |
           which brew || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
@@ -22,26 +21,26 @@ jobs:
         run: |
           brew install xcodegen just
 
-      - name: Run just setup
+      - name: Setup project (run just)
         run: just
 
-      - name: Build BitChat macOS App
+      - name: Build macOS app
         run: |
           xcodebuild \
             -project bitchat.xcodeproj \
-            -scheme bitchat \
+            -scheme "bitchat (macOS)" \
             -configuration Release \
             -destination 'platform=macOS' \
             build \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
 
-      - name: Archive .app bundle
+      - name: Archive .app
         run: |
           mkdir -p output
-          cp -R build/Release/BitChat.app output/ || cp -R bitchat/build/Release/BitChat.app output/
+          cp -R build/Release/bitchat.app output/
 
       - name: Upload .app artifact
         uses: actions/upload-artifact@v4
         with:
           name: BitChat-macOS-App
-          path: output/BitChat.app
+          path: output/bitchat.app
