@@ -49,7 +49,7 @@ jobs:
           path: ~/.xcodegen
           key: xcodegen-${{ env.XCODEGEN_VERSION }}
 
-      # Step 4: Validate project.yml exists
+      # Step 4: Validate and debug project.yml
       - name: Validate project configuration
         run: |
           if [ ! -f "project.yml" ]; then
@@ -58,18 +58,37 @@ jobs:
           fi
           echo "✅ project.yml found"
           
-          # Show basic project info for debugging
-          echo "📋 Project configuration summary:"
-          head -20 project.yml
+          # Show FULL project.yml for debugging
+          echo "📋 FULL Project configuration:"
+          cat project.yml
+          echo ""
+          echo "📁 Repository structure:"
+          find . -name "*.storyboard" -o -name "*.xib" -o -name "*.swift" | head -20
 
-      # Step 5: Generate Xcode project from project.yml using XcodeGen
+      # Step 5: Remove iOS-specific files that break macOS builds
+      - name: Remove iOS-specific files
+        run: |
+          echo "🧹 Removing iOS-specific files that break macOS builds..."
+          
+          # Remove LaunchScreen.storyboard if it exists
+          if [ -f "bitchat/LaunchScreen.storyboard" ]; then
+            echo "🗑️ Removing LaunchScreen.storyboard"
+            rm "bitchat/LaunchScreen.storyboard"
+          fi
+          
+          # Remove other common iOS-only files
+          find . -name "LaunchScreen.*" -delete 2>/dev/null || true
+          
+          echo "✅ iOS-specific files removed"
+
+      # Step 6: Generate Xcode project from project.yml using XcodeGen
       - name: Generate Xcode project
         uses: xavierLowmiller/xcodegen-action@1.2.4
         with:
           spec: project.yml
           version: ${{ env.XCODEGEN_VERSION }}
 
-      # Step 6: Verify the generated project and scheme
+      # Step 7: Verify the generated project and scheme
       - name: Verify Xcode project
         run: |
           # Find .xcodeproj files
@@ -102,18 +121,18 @@ jobs:
           fi
           echo "✅ Scheme '${{ env.SCHEME_NAME }}' verified"
 
-      # Step 7: Create build directory
+      # Step 8: Create build directory
       - name: Create build directory
         run: mkdir -p "${{ env.BUILD_PATH }}"
 
-      # Step 8: Clean any previous builds
+      # Step 9: Clean any previous builds
       - name: Clean build artifacts
         run: |
           xcodebuild clean \
             -scheme "${{ env.SCHEME_NAME }}" \
             -configuration Release
 
-      # Step 9: Build the macOS app with more specific destination
+      # Step 10: Build the macOS app with more specific destination
       - name: Build macOS app
         run: |
           set -o pipefail
@@ -138,7 +157,7 @@ jobs:
           
           echo "✅ Build completed successfully"
 
-      # Step 10: Extract and package .app (FIXED VERSION)
+      # Step 11: Extract and package .app (FIXED VERSION)
       - name: Extract and package .app
         run: |
           set -o pipefail
@@ -201,7 +220,7 @@ jobs:
             exit 1
           fi
 
-      # Step 11: Get build info for artifact naming
+      # Step 12: Get build info for artifact naming
       - name: Get build information
         id: build_info
         run: |
@@ -219,7 +238,7 @@ jobs:
           echo "branch_name=${CLEAN_BRANCH}" >> $GITHUB_OUTPUT
           echo "artifact_name=BitChat-macOS-${CLEAN_BRANCH}-${COMMIT_SHA}" >> $GITHUB_OUTPUT
 
-      # Step 12: Upload the ZIP as a downloadable artifact
+      # Step 13: Upload the ZIP as a downloadable artifact
       - name: Upload macOS app artifact
         uses: actions/upload-artifact@v4
         with:
@@ -228,7 +247,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      # Step 13: Add build summary
+      # Step 14: Add build summary
       - name: Build summary
         if: always()
         run: |
