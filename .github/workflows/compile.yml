@@ -143,7 +143,7 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>development</string>
+            <string>ad-hoc</string>
             <key>signingStyle</key>
             <string>manual</string>
             <key>compileBitcode</key>
@@ -154,10 +154,14 @@ jobs:
             <string>export</string>
             <key>thinning</key>
             <string>&lt;none&gt;</string>
+            <key>teamID</key>
+            <string></string>
             <key>signingCertificate</key>
             <string>-</string>
             <key>provisioningProfiles</key>
             <dict/>
+            <key>iCloudContainerEnvironment</key>
+            <string>Production</string>
           </dict>
           </plist>
           EOF
@@ -168,11 +172,27 @@ jobs:
           set -o pipefail
           
           echo "📦 Starting IPA export..."
+          
+          # Try export with explicit unsigned parameters
           xcodebuild -exportArchive \
             -archivePath "${{ env.BUILD_PATH }}/BitChat.xcarchive" \
             -exportPath "${{ env.BUILD_PATH }}/ipa" \
             -exportOptionsPlist "${{ env.BUILD_PATH }}/ExportOptions.plist" \
-            | xcpretty || exit 1
+            -allowProvisioningUpdates \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE="" \
+            DEVELOPMENT_TEAM="" \
+            | xcpretty || {
+            echo "❌ Export with xcpretty failed, trying without xcpretty for detailed output..."
+            xcodebuild -exportArchive \
+              -archivePath "${{ env.BUILD_PATH }}/BitChat.xcarchive" \
+              -exportPath "${{ env.BUILD_PATH }}/ipa" \
+              -exportOptionsPlist "${{ env.BUILD_PATH }}/ExportOptions.plist" \
+              -allowProvisioningUpdates \
+              CODE_SIGN_IDENTITY="" \
+              PROVISIONING_PROFILE="" \
+              DEVELOPMENT_TEAM=""
+          }
           
           # Verify IPA was created
           if [ -f "${{ env.BUILD_PATH }}/ipa"/*.ipa ]; then
@@ -180,7 +200,11 @@ jobs:
             ls -la "${{ env.BUILD_PATH }}/ipa"/*.ipa
           else
             echo "❌ Error: IPA file not found"
-            ls -la "${{ env.BUILD_PATH }}/ipa/"
+            echo "📁 Contents of export directory:"
+            ls -la "${{ env.BUILD_PATH }}/ipa/" || echo "Export directory doesn't exist"
+            
+            echo "📋 Export logs location (if any):"
+            find /var/folders -name "*.xcdistributionlogs" 2>/dev/null | head -5 || echo "No distribution logs found"
             exit 1
           fi
 
