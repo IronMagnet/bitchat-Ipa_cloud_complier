@@ -1,45 +1,66 @@
-# Step 9: Build the macOS app (enhanced)
-      - name: Build macOS app
+# Step 10: Extract and package .app (Fixed for macOS)
+      - name: Extract and package .app
         run: |
           set -o pipefail
           
-          echo "🏗️ Starting macOS build process..."
-          echo "Scheme: ${{ env.SCHEME_NAME }}"
-          echo "Target: ${{ env.TARGET_NAME }}"
+          echo "📦 Locating built .app bundle..."
           
-          # Get the project file
-          XCODEPROJ=$(find . -name "*.xcodeproj" -type d | head -n 1)
-          echo "Project: $XCODEPROJ"
+          # Find the .app bundle in DerivedData
+          APP_PATH=$(find "${{ env.BUILD_PATH }}/DerivedData" -name "*.app" -type d | head -n 1)
           
-          # Show build settings to debug
-          echo "🔍 Build settings verification:"
-          xcodebuild -showBuildSettings \
-            -scheme "${{ env.SCHEME_NAME }}" \
-            -project "$XCODEPROJ" \
-            -sdk macosx \
-            | grep -E "(SUPPORTED_PLATFORMS|PRODUCT_NAME|WRAPPER_EXTENSION|SDKROOT)" | head -5
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Error: No .app bundle found in build output"
+            echo "📁 DerivedData contents:"
+            find "${{ env.BUILD_PATH }}/DerivedData" -name "*.app" -o -name "Products" | head -10
+            exit 1
+          fi
           
-          echo ""
-          echo "🚀 Starting build..."
+          echo "✅ Found app bundle: $APP_PATH"
           
-          xcodebuild build \
-            -scheme "${{ env.SCHEME_NAME }}" \
-            -project "$XCODEPROJ" \
-            -sdk macosx \
-            -configuration Release \
-            -destination "platform=macOS,arch=arm64" \
-            -derivedDataPath "${{ env.BUILD_PATH }}/DerivedData" \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            SUPPORTED_PLATFORMS=macosx \
-            PRODUCT_BUNDLE_IDENTIFIER=com.yourcompany.bitchat.macos \
-            | xcpretty || exit 1
+          # Get app name for consistent naming
+          APP_NAME=$(basename "$APP_PATH" .app)
+          echo "📱 App name: $APP_NAME"
           
-          echo "✅ Build completed successfully"
+          # Create distribution directory (no Payload folder for macOS!)
+          mkdir -p "${{ env.BUILD_PATH }}/distribution"
           
-          # Debug: Show what was built
-          echo ""
-          echo "📦 Build products:"
-          find "${{ env.BUILD_PATH }}/DerivedData" -name "*.app" -o -name "*.ipa" | head -5
+          # Copy the .app bundle directly
+          echo "📁 Copying .app bundle..."
+          cp -R "$APP_PATH" "${{ env.BUILD_PATH }}/distribution/"
+          
+          # Remove any existing code signatures to make it truly unsigned
+          echo "🔓 Removing existing code signatures..."
+          find "${{ env.BUILD_PATH }}/distribution/$APP_NAME.app" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "${{ env.BUILD_PATH }}/distribution/$APP_NAME.app" -name "*.provisionprofile" -delete 2>/dev/null || true
+          
+          # Verify it's a macOS app bundle
+          echo "🔍 Verifying macOS app bundle..."
+          if [ -f "${{ env.BUILD_PATH }}/distribution/$APP_NAME.app/Contents/Info.plist" ]; then
+            echo "✅ Valid macOS app bundle structure (has Contents/Info.plist)"
+          else
+            echo "⚠️ Warning: App bundle might not be macOS format"
+            ls -la "${{ env.BUILD_PATH }}/distribution/$APP_NAME.app/"
+          fi
+          
+          # Create the ZIP file with correct naming
+          echo "📦 Creating ZIP archive..."
+          cd "${{ env.BUILD_PATH }}/distribution"
+          zip -r "../${APP_NAME}-macOS.zip" "$APP_NAME.app" -q
+          
+          # Verify ZIP was created with proper structure
+          if [ -f "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip" ]; then
+            echo "✅ macOS app ZIP created successfully"
+            ls -la "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip"
+            
+            # Show ZIP contents for verification (should show .app directly, no Payload folder)
+            echo "📋 ZIP contents:"
+            unzip -l "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip" | head -10
+            
+            # Show app bundle info
+            echo "📊 App bundle structure:"
+            unzip -l "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip" | grep -E "(Contents/|MacOS/)" | head -5
+          else
+            echo "❌ Error: ZIP file not created"
+            ls -la "${{ env.BUILD_PATH }}/"
+            exit 1
+          fi
