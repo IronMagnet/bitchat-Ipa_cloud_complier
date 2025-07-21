@@ -1,69 +1,45 @@
-# Example of how to structure your project.yml to separate iOS and macOS resources
-
-name: bitchat
-options:
-  bundleIdPrefix: com.yourcompany.bitchat
-
-targets:
-  bitchat_iOS:
-    type: application
-    platform: iOS
-    sources:
-      - bitchat/
-    resources:
-      - bitchat/Assets.xcassets
-      - bitchat/LaunchScreen.storyboard  # iOS only
-      - bitchat/Main.storyboard          # iOS only (if you have one)
-    info:
-      path: bitchat/Info.plist
-    scheme:
-      testTargets: []
-
-  bitchat_macOS:
-    type: application
-    platform: macOS
-    sources:
-      - bitchat/
-      # Exclude iOS-specific files
-      - path: bitchat/LaunchScreen.storyboard
-        excludes: ["**"]
-      - path: bitchat/Main.storyboard
-        excludes: ["**"]
-    resources:
-      - bitchat/Assets.xcassets
-      # Don't include LaunchScreen.storyboard here!
-    info:
-      path: bitchat/Info-macOS.plist  # Separate plist for macOS
-    scheme:
-      testTargets: []
-
-schemes:
-  bitchat (iOS):
-    build:
-      targets:
-        bitchat_iOS: all
-    run:
-      config: Debug
-    test:
-      config: Debug
-    profile:
-      config: Release
-    analyze:
-      config: Debug
-    archive:
-      config: Release
-
-  bitchat (macOS):
-    build:
-      targets:
-        bitchat_macOS: all
-    run:
-      config: Debug
-    test:
-      config: Debug
-    profile:
-      config: Release
-    analyze:
-      config: Debug
-    archive:
-      config: Release
+# Step 9: Build the macOS app (enhanced)
+      - name: Build macOS app
+        run: |
+          set -o pipefail
+          
+          echo "🏗️ Starting macOS build process..."
+          echo "Scheme: ${{ env.SCHEME_NAME }}"
+          echo "Target: ${{ env.TARGET_NAME }}"
+          
+          # Get the project file
+          XCODEPROJ=$(find . -name "*.xcodeproj" -type d | head -n 1)
+          echo "Project: $XCODEPROJ"
+          
+          # Show build settings to debug
+          echo "🔍 Build settings verification:"
+          xcodebuild -showBuildSettings \
+            -scheme "${{ env.SCHEME_NAME }}" \
+            -project "$XCODEPROJ" \
+            -sdk macosx \
+            | grep -E "(SUPPORTED_PLATFORMS|PRODUCT_NAME|WRAPPER_EXTENSION|SDKROOT)" | head -5
+          
+          echo ""
+          echo "🚀 Starting build..."
+          
+          xcodebuild build \
+            -scheme "${{ env.SCHEME_NAME }}" \
+            -project "$XCODEPROJ" \
+            -sdk macosx \
+            -configuration Release \
+            -destination "platform=macOS,arch=arm64" \
+            -derivedDataPath "${{ env.BUILD_PATH }}/DerivedData" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            SUPPORTED_PLATFORMS=macosx \
+            PRODUCT_BUNDLE_IDENTIFIER=com.yourcompany.bitchat.macos \
+            | xcpretty || exit 1
+          
+          echo "✅ Build completed successfully"
+          
+          # Debug: Show what was built
+          echo ""
+          echo "📦 Build products:"
+          find "${{ env.BUILD_PATH }}/DerivedData" -name "*.app" -o -name "*.ipa" | head -5
