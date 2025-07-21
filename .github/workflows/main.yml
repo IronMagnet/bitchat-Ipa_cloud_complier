@@ -40,14 +40,13 @@ jobs:
         # If project.yml or XcodeGen version changes, update here
 
     # Archive app for real device
-    - name: Archive app
-      run: |
-        set -o pipefail && xcodebuild archive \
-          -scheme BitChat \
-          -sdk iphoneos \
-          -configuration Release \
-          -archivePath $GITHUB_WORKSPACE/build/BitChat.xcarchive
-        # Replace -scheme if BitChat scheme name changes
+- name: Archive app
+  run: |
+    set -o pipefail && xcodebuild archive \
+      -scheme "bitchat (iOS)" \
+      -sdk iphoneos \
+      -configuration Release \
+      -archivePath $GITHUB_WORKSPACE/build/BitChat.xcarchive
 
     # Export unsigned IPA for sideloading/signing later
     - name: Export IPA
