@@ -1,4 +1,138 @@
-# Step 10: Extract and package .app (Fixed for macOS)
+# =====================================
+# GitHub Actions Workflow: compile-macos.yml
+# Purpose: Build & export BitChat as .app for macOS (no tests)
+# =====================================
+
+name: Compile BitChat macOS
+
+on:
+  # Trigger workflow on push or PR to main branch
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+env:
+  # Global environment variables for consistency
+  XCODE_VERSION: "16.4"
+  XCODEGEN_VERSION: "2.43.0"
+  SCHEME_NAME: "bitchat (macOS)"
+  BUILD_PATH: "${{ github.workspace }}/build"
+
+jobs:
+  compile:
+    name: Build BitChat macOS App
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      # Step 1: Checkout the repo source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step 2: Setup Xcode environment with specified version
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      # Step 3: Cache XcodeGen binary to speed up builds
+      - name: Cache XcodeGen
+        uses: actions/cache@v4
+        with:
+          path: ~/.xcodegen
+          key: xcodegen-${{ env.XCODEGEN_VERSION }}
+
+      # Step 4: Validate project.yml exists
+      - name: Validate project configuration
+        run: |
+          if [ ! -f "project.yml" ]; then
+            echo "❌ Error: project.yml not found in repository root"
+            exit 1
+          fi
+          echo "✅ project.yml found"
+          
+          # Show basic project info for debugging
+          echo "📋 Project configuration summary:"
+          head -20 project.yml
+
+      # Step 5: Generate Xcode project from project.yml using XcodeGen
+      - name: Generate Xcode project
+        uses: xavierLowmiller/xcodegen-action@1.2.4
+        with:
+          spec: project.yml
+          version: ${{ env.XCODEGEN_VERSION }}
+
+      # Step 6: Verify the generated project and scheme
+      - name: Verify Xcode project
+        run: |
+          # Find .xcodeproj files
+          XCODEPROJ_COUNT=$(find . -name "*.xcodeproj" -type d | wc -l)
+          
+          if [ "$XCODEPROJ_COUNT" -eq 0 ]; then
+            echo "❌ Error: No .xcodeproj found after XcodeGen"
+            echo "📁 Current directory contents:"
+            ls -la
+            exit 1
+          elif [ "$XCODEPROJ_COUNT" -gt 1 ]; then
+            echo "⚠️ Warning: Multiple .xcodeproj files found:"
+            find . -name "*.xcodeproj" -type d
+          fi
+          
+          # Get the first .xcodeproj file
+          XCODEPROJ=$(find . -name "*.xcodeproj" -type d | head -n 1)
+          echo "✅ Using Xcode project: $XCODEPROJ"
+          
+          # List available schemes for verification
+          echo "📱 Available schemes:"
+          xcodebuild -list -project "$XCODEPROJ" | grep -A 10 "Schemes:"
+          
+          # Verify our target scheme exists
+          if ! xcodebuild -list -project "$XCODEPROJ" | grep -q "${{ env.SCHEME_NAME }}"; then
+            echo "❌ Error: Scheme '${{ env.SCHEME_NAME }}' not found"
+            echo "Available schemes:"
+            xcodebuild -list -project "$XCODEPROJ"
+            exit 1
+          fi
+          echo "✅ Scheme '${{ env.SCHEME_NAME }}' verified"
+
+      # Step 7: Create build directory
+      - name: Create build directory
+        run: mkdir -p "${{ env.BUILD_PATH }}"
+
+      # Step 8: Clean any previous builds
+      - name: Clean build artifacts
+        run: |
+          xcodebuild clean \
+            -scheme "${{ env.SCHEME_NAME }}" \
+            -configuration Release
+
+      # Step 9: Build the macOS app
+      - name: Build macOS app
+        run: |
+          set -o pipefail
+          
+          echo "🏗️ Starting macOS build process..."
+          xcodebuild build \
+            -scheme "${{ env.SCHEME_NAME }}" \
+            -sdk macosx \
+            -configuration Release \
+            -destination "platform=macOS" \
+            -derivedDataPath "${{ env.BUILD_PATH }}/DerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || exit 1
+          
+          echo "✅ Build completed successfully"
+
+      # Step 10: Extract and package .app (FIXED VERSION)
       - name: Extract and package .app
         run: |
           set -o pipefail
@@ -28,7 +162,7 @@
           echo "📁 Copying .app bundle..."
           cp -R "$APP_PATH" "${{ env.BUILD_PATH }}/distribution/"
           
-          # Remove any existing code signatures to make it truly unsigned
+          # Remove any existing code signatures
           echo "🔓 Removing existing code signatures..."
           find "${{ env.BUILD_PATH }}/distribution/$APP_NAME.app" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
           find "${{ env.BUILD_PATH }}/distribution/$APP_NAME.app" -name "*.provisionprofile" -delete 2>/dev/null || true
@@ -47,20 +181,70 @@
           cd "${{ env.BUILD_PATH }}/distribution"
           zip -r "../${APP_NAME}-macOS.zip" "$APP_NAME.app" -q
           
-          # Verify ZIP was created with proper structure
+          # Verify ZIP was created
           if [ -f "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip" ]; then
             echo "✅ macOS app ZIP created successfully"
             ls -la "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip"
             
-            # Show ZIP contents for verification (should show .app directly, no Payload folder)
+            # Show ZIP contents (should show .app directly, no Payload folder)
             echo "📋 ZIP contents:"
             unzip -l "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip" | head -10
-            
-            # Show app bundle info
-            echo "📊 App bundle structure:"
-            unzip -l "${{ env.BUILD_PATH }}/${APP_NAME}-macOS.zip" | grep -E "(Contents/|MacOS/)" | head -5
           else
             echo "❌ Error: ZIP file not created"
             ls -la "${{ env.BUILD_PATH }}/"
             exit 1
+          fi
+
+      # Step 11: Get build info for artifact naming
+      - name: Get build information
+        id: build_info
+        run: |
+          COMMIT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BRANCH_NAME="${{ github.head_ref }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+          fi
+          
+          CLEAN_BRANCH=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "branch_name=${CLEAN_BRANCH}" >> $GITHUB_OUTPUT
+          echo "artifact_name=BitChat-macOS-${CLEAN_BRANCH}-${COMMIT_SHA}" >> $GITHUB_OUTPUT
+
+      # Step 12: Upload the ZIP as a downloadable artifact
+      - name: Upload macOS app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build_info.outputs.artifact_name }}
+          path: ${{ env.BUILD_PATH }}/*-macOS.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      # Step 13: Add build summary
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## 🖥️ BitChat macOS Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ **Build Status**: Success" >> $GITHUB_STEP_SUMMARY
+            echo "💻 **Platform**: macOS" >> $GITHUB_STEP_SUMMARY
+            echo "📱 **Scheme**: ${{ env.SCHEME_NAME }}" >> $GITHUB_STEP_SUMMARY
+            echo "🔧 **Xcode Version**: ${{ env.XCODE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+            echo "📦 **Artifact**: ${{ steps.build_info.outputs.artifact_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "🌿 **Branch**: ${{ steps.build_info.outputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "📝 **Commit**: ${{ steps.build_info.outputs.commit_sha }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 **Next Steps**:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Download the ZIP artifact" >> $GITHUB_STEP_SUMMARY
+            echo "2. Extract the .app bundle" >> $GITHUB_STEP_SUMMARY
+            echo "3. Move to Applications folder or run directly" >> $GITHUB_STEP_SUMMARY
+            echo "4. If needed, right-click → Open to bypass Gatekeeper" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Build Status**: Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 Check the logs above for detailed error information." >> $GITHUB_STEP_SUMMARY
           fi
