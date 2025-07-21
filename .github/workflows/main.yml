@@ -1,0 +1,129 @@
+# =====================================
+# GitHub Actions Workflow: compile.yml
+# Purpose: Build & export BitChat as .ipa AND run tests
+# =====================================
+
+name: Compile and Test
+
+on:
+  # Trigger workflow when code is pushed to `main` branch
+  # or a pull request targets `main`.
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  compile-test:
+    # Run this job on a macOS runner — required for Xcode and iOS SDK
+    runs-on: macos-15  # NOTE: You can change to macos-14, macos-13, etc. if GitHub updates or you need another version.
+
+    steps:
+    # ---------------------------------
+    # Step 1: Checkout the repository
+    # ---------------------------------
+    - name: Checkout
+      uses: actions/checkout@v4
+      # This checks out the current commit into the runner’s workspace
+
+    # ---------------------------------
+    # Step 2: Set up Xcode
+    # ---------------------------------
+    - name: Set up Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: "16.4"  
+        # NOTE: If BitChat requires a newer iOS SDK or Xcode version later,
+        # update this to match (e.g. "16.5" or "17.x"). 
+        # You can check which Xcode versions are available at:
+        # https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md
+
+    # ---------------------------------
+    # Step 3: Generate Xcode project
+    # ---------------------------------
+    - name: XcodeGen
+      uses: xavierLowmiller/xcodegen-action@1.2.4
+      with:
+        spec: project.yml           # This is the project spec file for XcodeGen
+        version: 2.43.0             # XcodeGen version to use
+        # NOTE: If project.yml changes or XcodeGen releases a breaking change,
+        # you might need to adjust `spec` path or `version`.
+
+    # ---------------------------------
+    # Step 4: Run tests in iOS Simulator
+    # ---------------------------------
+    - name: Run iOS Simulator tests
+      run: |
+        # Run unit/UI tests defined in scheme `bitchatTests_iOS`
+        # against the iOS Simulator (not a real device).
+        # NOTE: If the test scheme name or target Simulator changes, update here.
+        set -o pipefail && xcodebuild test \
+          -scheme bitchatTests_iOS \
+          -destination "platform=iOS Simulator,name=iPhone 16" | xcpretty
+        # Available Simulator device names may change — check with:
+        # `xcrun simctl list devices` to get valid names.
+
+    # ---------------------------------
+    # Step 5: Build and archive for real iOS device
+    # ---------------------------------
+    - name: Archive app
+      run: |
+        # This creates an archived build (.xcarchive) targeting real iOS devices.
+        # NOTE: If the main app scheme name changes, update `-scheme BitChat`.
+        set -o pipefail && xcodebuild archive \
+          -scheme BitChat \
+          -sdk iphoneos \
+          -configuration Release \
+          -archivePath $GITHUB_WORKSPACE/build/BitChat.xcarchive
+
+    # ---------------------------------
+    # Step 6: Export .ipa
+    # ---------------------------------
+    - name: Export IPA
+      run: |
+        # Create ExportOptions.plist for `xcodebuild -exportArchive`
+        # This controls export type (development, ad-hoc, etc.)
+        # Here we use `development` and automatic signing because
+        # we intend to sign later with SideStore or LiveContainer.
+        cat > ExportOptions.plist <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>method</key>
+          <string>development</string>
+          <key>signingStyle</key>
+          <string>automatic</string>
+          <key>compileBitcode</key>
+          <false/>
+          <key>stripSwiftSymbols</key>
+          <true/>
+          <key>destination</key>
+          <string>export</string>
+          <key>thinning</key>
+          <string>&lt;none&gt;</string>
+        </dict>
+        </plist>
+        EOF
+
+        # Export the .ipa package to build/ipa/
+        xcodebuild -exportArchive \
+          -archivePath $GITHUB_WORKSPACE/build/BitChat.xcarchive \
+          -exportPath $GITHUB_WORKSPACE/build/ipa \
+          -exportOptionsPlist ExportOptions.plist
+
+        # NOTE: If you later want to sign properly for App Store or Ad Hoc,
+        # change `method` above to `app-store` or `ad-hoc`
+        # and provide certificates and provisioning profiles.
+
+    # ---------------------------------
+    # Step 7: Upload the built .ipa as an artifact
+    # ---------------------------------
+    - name: Upload IPA artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: BitChat-ipa
+        path: build/ipa
+        # This makes the .ipa downloadable from the GitHub Actions UI after the job completes.
