@@ -1,0 +1,245 @@
+# =====================================
+# GitHub Actions Workflow: compile.yml
+# Purpose: Build & export BitChat as .ipa (no tests)
+# =====================================
+
+name: Compile BitChat iOS
+
+on:
+  # Trigger workflow on push or PR to main branch
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+env:
+  # Global environment variables for consistency
+  XCODE_VERSION: "16.4"
+  XCODEGEN_VERSION: "2.43.0"
+  SCHEME_NAME: "bitchat (iOS)"
+  BUILD_PATH: "${{ github.workspace }}/build"
+
+jobs:
+  compile:
+    name: Build BitChat IPA
+    runs-on: macos-15
+    timeout-minutes: 30  # Prevent hanging builds
+
+    steps:
+      # Step 1: Checkout the repo source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for proper version info if needed
+          fetch-depth: 0
+
+      # Step 2: Setup Xcode environment with specified version
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      # Step 3: Cache XcodeGen binary to speed up builds
+      - name: Cache XcodeGen
+        uses: actions/cache@v4
+        with:
+          path: ~/.xcodegen
+          key: xcodegen-${{ env.XCODEGEN_VERSION }}
+
+      # Step 4: Validate project.yml exists
+      - name: Validate project configuration
+        run: |
+          if [ ! -f "project.yml" ]; then
+            echo "❌ Error: project.yml not found in repository root"
+            exit 1
+          fi
+          echo "✅ project.yml found"
+          
+          # Show basic project info for debugging
+          echo "📋 Project configuration summary:"
+          head -20 project.yml
+
+      # Step 5: Generate Xcode project from project.yml using XcodeGen
+      - name: Generate Xcode project
+        uses: xavierLowmiller/xcodegen-action@1.2.4
+        with:
+          spec: project.yml
+          version: ${{ env.XCODEGEN_VERSION }}
+
+      # Step 6: Verify the generated project and scheme
+      - name: Verify Xcode project
+        run: |
+          if [ ! -d "*.xcodeproj" ]; then
+            echo "❌ Error: No .xcodeproj found after XcodeGen"
+            exit 1
+          fi
+          
+          # List available schemes for verification
+          echo "📱 Available schemes:"
+          xcodebuild -list -project *.xcodeproj | grep -A 10 "Schemes:"
+          
+          # Verify our target scheme exists
+          if ! xcodebuild -list -project *.xcodeproj | grep -q "${{ env.SCHEME_NAME }}"; then
+            echo "❌ Error: Scheme '${{ env.SCHEME_NAME }}' not found"
+            exit 1
+          fi
+          echo "✅ Scheme '${{ env.SCHEME_NAME }}' verified"
+
+      # Step 7: Create build directory
+      - name: Create build directory
+        run: mkdir -p "${{ env.BUILD_PATH }}"
+
+      # Step 8: Clean any previous builds
+      - name: Clean build artifacts
+        run: |
+          xcodebuild clean \
+            -scheme "${{ env.SCHEME_NAME }}" \
+            -configuration Release
+
+      # Step 9: Archive the app for device deployment
+      - name: Archive app
+        run: |
+          set -o pipefail
+          
+          echo "🏗️ Starting archive process..."
+          xcodebuild archive \
+            -scheme "${{ env.SCHEME_NAME }}" \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "${{ env.BUILD_PATH }}/BitChat.xcarchive" \
+            DEVELOPMENT_TEAM="" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcpretty || exit 1
+          
+          echo "✅ Archive completed successfully"
+
+      # Step 10: Create export options plist
+      - name: Create export options
+        run: |
+          cat > "${{ env.BUILD_PATH }}/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>development</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>destination</key>
+            <string>export</string>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+            <key>signingCertificate</key>
+            <string>-</string>
+            <key>provisioningProfiles</key>
+            <dict/>
+          </dict>
+          </plist>
+          EOF
+
+      # Step 11: Export unsigned IPA
+      - name: Export IPA
+        run: |
+          set -o pipefail
+          
+          echo "📦 Starting IPA export..."
+          xcodebuild -exportArchive \
+            -archivePath "${{ env.BUILD_PATH }}/BitChat.xcarchive" \
+            -exportPath "${{ env.BUILD_PATH }}/ipa" \
+            -exportOptionsPlist "${{ env.BUILD_PATH }}/ExportOptions.plist" \
+            | xcpretty || exit 1
+          
+          # Verify IPA was created
+          if [ -f "${{ env.BUILD_PATH }}/ipa"/*.ipa ]; then
+            echo "✅ IPA export completed successfully"
+            ls -la "${{ env.BUILD_PATH }}/ipa"/*.ipa
+          else
+            echo "❌ Error: IPA file not found"
+            ls -la "${{ env.BUILD_PATH }}/ipa/"
+            exit 1
+          fi
+
+      # Step 12: Get build info for artifact naming
+      - name: Get build information
+        id: build_info
+        run: |
+          # Get commit SHA (short)
+          COMMIT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          
+          # Get branch name
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BRANCH_NAME="${{ github.head_ref }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+          fi
+          
+          # Clean branch name for file naming
+          CLEAN_BRANCH=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          
+          # Set outputs
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "branch_name=${CLEAN_BRANCH}" >> $GITHUB_OUTPUT
+          echo "artifact_name=BitChat-${CLEAN_BRANCH}-${COMMIT_SHA}" >> $GITHUB_OUTPUT
+
+      # Step 13: Upload the IPA as a downloadable artifact
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build_info.outputs.artifact_name }}
+          path: ${{ env.BUILD_PATH }}/ipa/*.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      # Step 14: Add build summary
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## 🍎 BitChat iOS Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ **Build Status**: Success" >> $GITHUB_STEP_SUMMARY
+            echo "📱 **Scheme**: ${{ env.SCHEME_NAME }}" >> $GITHUB_STEP_SUMMARY
+            echo "🔧 **Xcode Version**: ${{ env.XCODE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+            echo "📦 **Artifact**: ${{ steps.build_info.outputs.artifact_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "🌿 **Branch**: ${{ steps.build_info.outputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "📝 **Commit**: ${{ steps.build_info.outputs.commit_sha }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 **Next Steps**: Download the artifact and sideload using SideStore or similar tools." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Build Status**: Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 Check the logs above for detailed error information." >> $GITHUB_STEP_SUMMARY
+          fi
+
+# ===
+# ADDITIONAL NOTES:
+# 
+# Security Considerations:
+# - This workflow creates unsigned IPAs suitable for sideloading
+# - No sensitive signing certificates or provisioning profiles are used
+# - Code signing is explicitly disabled for CI builds
+#
+# Customization Options:
+# - Update XCODE_VERSION env var when new Xcode versions are released
+# - Modify SCHEME_NAME if your project.yml changes
+# - Adjust timeout-minutes based on your build complexity
+# - Change retention-days for artifacts based on your needs
+#
+# Troubleshooting:
+# - Check "Verify Xcode project" step output if scheme issues occur
+# - Archive logs are piped through xcpretty for cleaner output
+# - Build summary provides quick status overview
+# - All critical paths use environment variables for consistency
+#
