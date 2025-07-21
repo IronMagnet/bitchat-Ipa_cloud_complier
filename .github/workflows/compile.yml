@@ -73,18 +73,32 @@ jobs:
       # Step 6: Verify the generated project and scheme
       - name: Verify Xcode project
         run: |
-          if [ ! -d "*.xcodeproj" ]; then
+          # Find .xcodeproj files (proper globbing)
+          XCODEPROJ_COUNT=$(find . -name "*.xcodeproj" -type d | wc -l)
+          
+          if [ "$XCODEPROJ_COUNT" -eq 0 ]; then
             echo "❌ Error: No .xcodeproj found after XcodeGen"
+            echo "📁 Current directory contents:"
+            ls -la
             exit 1
+          elif [ "$XCODEPROJ_COUNT" -gt 1 ]; then
+            echo "⚠️ Warning: Multiple .xcodeproj files found:"
+            find . -name "*.xcodeproj" -type d
           fi
+          
+          # Get the first .xcodeproj file
+          XCODEPROJ=$(find . -name "*.xcodeproj" -type d | head -n 1)
+          echo "✅ Using Xcode project: $XCODEPROJ"
           
           # List available schemes for verification
           echo "📱 Available schemes:"
-          xcodebuild -list -project *.xcodeproj | grep -A 10 "Schemes:"
+          xcodebuild -list -project "$XCODEPROJ" | grep -A 10 "Schemes:"
           
           # Verify our target scheme exists
-          if ! xcodebuild -list -project *.xcodeproj | grep -q "${{ env.SCHEME_NAME }}"; then
+          if ! xcodebuild -list -project "$XCODEPROJ" | grep -q "${{ env.SCHEME_NAME }}"; then
             echo "❌ Error: Scheme '${{ env.SCHEME_NAME }}' not found"
+            echo "Available schemes:"
+            xcodebuild -list -project "$XCODEPROJ"
             exit 1
           fi
           echo "✅ Scheme '${{ env.SCHEME_NAME }}' verified"
