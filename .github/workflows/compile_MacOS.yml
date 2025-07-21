@@ -113,13 +113,21 @@ jobs:
           xcodebuild -list -project "$XCODEPROJ" | grep -A 10 "Schemes:"
           
           # Verify our target scheme exists
-          if ! xcodebuild -list -project "$XCODEPROJ" | grep -q "${{ env.SCHEME_NAME }}"; then
+          echo "🔍 Looking for scheme: '${{ env.SCHEME_NAME }}'"
+          
+          # Debug: Show exact scheme list
+          echo "📋 All available schemes (raw output):"
+          xcodebuild -list -project "$XCODEPROJ" | grep -A 20 "Schemes:"
+          
+          # Check if scheme exists (case-sensitive)
+          if xcodebuild -list -project "$XCODEPROJ" | grep -F "${{ env.SCHEME_NAME }}"; then
+            echo "✅ Scheme '${{ env.SCHEME_NAME }}' found and verified"
+          else
             echo "❌ Error: Scheme '${{ env.SCHEME_NAME }}' not found"
             echo "Available schemes:"
             xcodebuild -list -project "$XCODEPROJ"
             exit 1
           fi
-          echo "✅ Scheme '${{ env.SCHEME_NAME }}' verified"
 
       # Step 8: Create build directory
       - name: Create build directory
@@ -138,9 +146,11 @@ jobs:
           set -o pipefail
           
           echo "🏗️ Starting macOS build process..."
+          echo "📱 Building scheme: '${{ env.SCHEME_NAME }}'"
           
           # Get the project file
           XCODEPROJ=$(find . -name "*.xcodeproj" -type d | head -n 1)
+          echo "📂 Using project: $XCODEPROJ"
           
           xcodebuild build \
             -project "$XCODEPROJ" \
