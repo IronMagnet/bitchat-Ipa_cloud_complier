@@ -113,21 +113,27 @@ jobs:
             -scheme "${{ env.SCHEME_NAME }}" \
             -configuration Release
 
-      # Step 9: Build the macOS app
+      # Step 9: Build the macOS app with more specific destination
       - name: Build macOS app
         run: |
           set -o pipefail
           
           echo "🏗️ Starting macOS build process..."
+          
+          # Get the project file
+          XCODEPROJ=$(find . -name "*.xcodeproj" -type d | head -n 1)
+          
           xcodebuild build \
+            -project "$XCODEPROJ" \
             -scheme "${{ env.SCHEME_NAME }}" \
             -sdk macosx \
             -configuration Release \
-            -destination "platform=macOS" \
+            -destination "platform=macOS,arch=arm64" \
             -derivedDataPath "${{ env.BUILD_PATH }}/DerivedData" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
             | xcpretty || exit 1
           
           echo "✅ Build completed successfully"
