@@ -11,9 +11,9 @@ import Compression
 
 struct CompressionUtil {
     // Compression threshold - don't compress if data is smaller than this
-    static let compressionThreshold = 100 // bytes
+    static let compressionThreshold = TransportConfig.compressionThresholdBytes // bytes
     
-    // Compress data using LZ4 algorithm (fast compression/decompression)
+    // Compress data using zlib algorithm (most compatible)
     static func compress(_ data: Data) -> Data? {
         // Skip compression for small data
         guard data.count >= compressionThreshold else { return nil }
@@ -27,7 +27,7 @@ struct CompressionUtil {
             return compression_encode_buffer(
                 destinationBuffer, data.count,
                 sourcePtr, data.count,
-                nil, COMPRESSION_LZ4
+                nil, COMPRESSION_ZLIB
             )
         }
         
@@ -36,7 +36,7 @@ struct CompressionUtil {
         return Data(bytes: destinationBuffer, count: compressedSize)
     }
     
-    // Decompress LZ4 compressed data
+    // Decompress zlib compressed data
     static func decompress(_ compressedData: Data, originalSize: Int) -> Data? {
         let destinationBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: originalSize)
         defer { destinationBuffer.deallocate() }
@@ -46,7 +46,7 @@ struct CompressionUtil {
             return compression_decode_buffer(
                 destinationBuffer, originalSize,
                 sourcePtr, compressedData.count,
-                nil, COMPRESSION_LZ4
+                nil, COMPRESSION_ZLIB
             )
         }
         
@@ -61,15 +61,13 @@ struct CompressionUtil {
         // 1. Data is too small
         // 2. Data appears to be already compressed (high entropy)
         guard data.count >= compressionThreshold else { return false }
-        
-        // Simple entropy check - count unique bytes
-        var byteFrequency = [UInt8: Int]()
-        for byte in data {
-            byteFrequency[byte, default: 0] += 1
-        }
-        
-        // If we have very high byte diversity, data is likely already compressed
-        let uniqueByteRatio = Double(byteFrequency.count) / Double(min(data.count, 256))
+
+        // Quick uniqueness check — a high diversity of bytes usually means the
+        // payload is already compressed. We only need to know how many unique
+        // values exist rather than keeping full frequency counts.
+        let uniqueByteCount = Set(data).count
+        let sampleSize = min(data.count, 256)
+        let uniqueByteRatio = Double(uniqueByteCount) / Double(sampleSize)
         return uniqueByteRatio < 0.9 // Compress if less than 90% unique bytes
     }
 }

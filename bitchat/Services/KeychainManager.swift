@@ -6,151 +6,89 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Foundation
 import Security
-import os.log
 
-class KeychainManager {
-    static let shared = KeychainManager()
-    
+// MARK: - Keychain Error Types
+// BCH-01-009: Proper error classification to distinguish expected states from critical failures
+
+/// Result of a keychain read operation with proper error classification
+enum KeychainReadResult {
+    case success(Data)
+    case itemNotFound        // Expected: key doesn't exist yet
+    case accessDenied        // Critical: app lacks keychain access
+    case deviceLocked        // Recoverable: device is locked
+    case authenticationFailed // Recoverable: biometric/passcode failed
+    case otherError(OSStatus) // Unexpected error
+
+    var isRecoverableError: Bool {
+        switch self {
+        case .deviceLocked, .authenticationFailed:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Result of a keychain save operation with proper error classification
+enum KeychainSaveResult {
+    case success
+    case duplicateItem       // Can retry with update
+    case accessDenied        // Critical: app lacks keychain access
+    case deviceLocked        // Recoverable: device is locked
+    case storageFull         // Critical: no space available
+    case otherError(OSStatus)
+
+    var isRecoverableError: Bool {
+        switch self {
+        case .duplicateItem, .deviceLocked:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+protocol KeychainManagerProtocol {
+    func saveIdentityKey(_ keyData: Data, forKey key: String) -> Bool
+    func getIdentityKey(forKey key: String) -> Data?
+    func deleteIdentityKey(forKey key: String) -> Bool
+    func deleteAllKeychainData() -> Bool
+
+    func secureClear(_ data: inout Data)
+    func secureClear(_ string: inout String)
+
+    func verifyIdentityKeyExists() -> Bool
+
+    // BCH-01-009: Methods with proper error classification
+    /// Get identity key with detailed result for error handling
+    func getIdentityKeyWithResult(forKey key: String) -> KeychainReadResult
+    /// Save identity key with detailed result for error handling
+    func saveIdentityKeyWithResult(_ keyData: Data, forKey key: String) -> KeychainSaveResult
+
+    // MARK: - Generic Data Storage (consolidated from KeychainHelper)
+    /// Save data with a custom service name
+    func save(key: String, data: Data, service: String, accessible: CFString?)
+    /// Load data from a custom service
+    func load(key: String, service: String) -> Data?
+    /// Delete data from a custom service
+    func delete(key: String, service: String)
+}
+
+final class KeychainManager: KeychainManagerProtocol {
     // Use consistent service name for all keychain items
-    private let service = "chat.bitchat"
-    private let appGroup = "group.chat.bitchat"
-    
-    private init() {
-        // Clean up legacy keychain items on first run
-        cleanupLegacyKeychainItems()
-    }
-    
-    private func cleanupLegacyKeychainItems() {
-        // Check if we've already done cleanup
-        let cleanupKey = "bitchat.keychain.cleanup.v2"
-        if UserDefaults.standard.bool(forKey: cleanupKey) {
-            return
-        }
-        
-        
-        // List of old service names to migrate from
-        let legacyServices = [
-            "com.bitchat.passwords",
-            "com.bitchat.deviceidentity",
-            "com.bitchat.noise.identity",
-            "chat.bitchat.passwords",
-            "bitchat.keychain"
-        ]
-        
-        var migratedItems = 0
-        
-        // Try to migrate identity keys
-        for oldService in legacyServices {
-            // Check for noise identity key
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: oldService,
-                kSecAttrAccount as String: "identity_noiseStaticKey",
-                kSecReturnData as String: true
-            ]
-            
-            var result: AnyObject?
-            let status = SecItemCopyMatching(query as CFDictionary, &result)
-            
-            if status == errSecSuccess, let data = result as? Data {
-                // Save to new service
-                if saveIdentityKey(data, forKey: "noiseStaticKey") {
-                    migratedItems += 1
-                }
-                // Delete from old service
-                let deleteQuery: [String: Any] = [
-                    kSecClass as String: kSecClassGenericPassword,
-                    kSecAttrService as String: oldService,
-                    kSecAttrAccount as String: "identity_noiseStaticKey"
-                ]
-                SecItemDelete(deleteQuery as CFDictionary)
-            }
-        }
-        
-        // Clean up all other legacy items
-        for oldService in legacyServices {
-            let deleteQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: oldService
-            ]
-            
-            SecItemDelete(deleteQuery as CFDictionary)
-        }
-        
-        
-        // Mark cleanup as done
-        UserDefaults.standard.set(true, forKey: cleanupKey)
-    }
-    
-    
-    private func isSandboxed() -> Bool {
-        #if os(macOS)
-        let environment = ProcessInfo.processInfo.environment
-        return environment["APP_SANDBOX_CONTAINER_ID"] != nil
-        #else
-        return false
-        #endif
-    }
-    
-    // MARK: - Channel Passwords
-    
-    func saveChannelPassword(_ password: String, for channel: String) -> Bool {
-        let key = "channel_\(channel)"
-        return save(password, forKey: key)
-    }
-    
-    func getChannelPassword(for channel: String) -> String? {
-        let key = "channel_\(channel)"
-        return retrieve(forKey: key)
-    }
-    
-    func deleteChannelPassword(for channel: String) -> Bool {
-        let key = "channel_\(channel)"
-        return delete(forKey: key)
-    }
-    
-    func getAllChannelPasswords() -> [String: String] {
-        var passwords: [String: String] = [:]
-        
-        // Build query without kSecReturnData to avoid error -50
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecReturnAttributes as String: true
-        ]
-        
-        // For sandboxed apps, use the app group
-        if isSandboxed() {
-            query[kSecAttrAccessGroup as String] = appGroup
-        }
-        
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        
-        if status == errSecSuccess, let items = result as? [[String: Any]] {
-            for item in items {
-                if let account = item[kSecAttrAccount as String] as? String,
-                   account.hasPrefix("channel_") {
-                    // Now retrieve the actual password data for this specific item
-                    let channel = String(account.dropFirst(8)) // Remove "channel_" prefix
-                    if let password = getChannelPassword(for: channel) {
-                        passwords[channel] = password
-                    }
-                }
-            }
-        }
-        
-        return passwords
-    }
+    private let service = BitchatApp.bundleID
+    private let appGroup = "group.\(BitchatApp.bundleID)"
     
     // MARK: - Identity Keys
     
     func saveIdentityKey(_ keyData: Data, forKey key: String) -> Bool {
         let fullKey = "identity_\(key)"
-        return saveData(keyData, forKey: fullKey)
+        let result = saveData(keyData, forKey: fullKey)
+        SecureLogger.logKeyOperation(.save, keyType: key, success: result)
+        return result
     }
     
     func getIdentityKey(forKey key: String) -> Data? {
@@ -159,9 +97,185 @@ class KeychainManager {
     }
     
     func deleteIdentityKey(forKey key: String) -> Bool {
-        return delete(forKey: "identity_\(key)")
+        let result = delete(forKey: "identity_\(key)")
+        SecureLogger.logKeyOperation(.delete, keyType: key, success: result)
+        return result
     }
-    
+
+    // MARK: - BCH-01-009: Methods with Proper Error Classification
+
+    /// Get identity key with detailed result for proper error handling
+    /// Distinguishes between missing keys (expected) and critical failures
+    func getIdentityKeyWithResult(forKey key: String) -> KeychainReadResult {
+        let fullKey = "identity_\(key)"
+        return retrieveDataWithResult(forKey: fullKey)
+    }
+
+    /// Save identity key with detailed result and retry logic for transient errors
+    func saveIdentityKeyWithResult(_ keyData: Data, forKey key: String) -> KeychainSaveResult {
+        let fullKey = "identity_\(key)"
+        return saveDataWithResult(keyData, forKey: fullKey)
+    }
+
+    /// Internal method to save data with detailed result and retry for transient errors
+    private func saveDataWithResult(_ data: Data, forKey key: String, retryCount: Int = 2) -> KeychainSaveResult {
+        // Delete any existing item first to ensure clean state
+        _ = delete(forKey: key)
+
+        // Build base query
+        var base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: data,
+            kSecAttrService as String: service,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+            kSecAttrLabel as String: "bitchat-\(key)"
+        ]
+        #if os(macOS)
+        base[kSecAttrSynchronizable as String] = false
+        #endif
+
+        func attempt(addAccessGroup: Bool) -> OSStatus {
+            var query = base
+            if addAccessGroup { query[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemAdd(query as CFDictionary, nil)
+        }
+
+        #if os(iOS)
+        var status = attempt(addAccessGroup: true)
+        if status == -34018 { // Missing entitlement, retry without access group
+            status = attempt(addAccessGroup: false)
+        }
+        #else
+        let status = attempt(addAccessGroup: false)
+        #endif
+
+        // Classify the result
+        let result = classifySaveStatus(status)
+
+        // Log all outcomes consistently
+        switch result {
+        case .success:
+            SecureLogger.debug("Keychain save succeeded for key: \(key)", category: .keychain)
+        case .duplicateItem:
+            SecureLogger.warning("Keychain save found duplicate for key: \(key)", category: .keychain)
+        case .accessDenied:
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)),
+                               context: "Keychain access denied for key: \(key)", category: .keychain)
+        case .deviceLocked:
+            SecureLogger.warning("Device locked during keychain save for key: \(key)", category: .keychain)
+        case .storageFull:
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)),
+                               context: "Keychain storage full for key: \(key)", category: .keychain)
+        case .otherError(let code):
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(code)),
+                               context: "Keychain save failed for key: \(key)", category: .keychain)
+        }
+
+        // Retry transient errors with exponential backoff
+        if result.isRecoverableError && retryCount > 0 {
+            let delayMs = UInt32((3 - retryCount) * 100) // 100ms, 200ms backoff
+            usleep(delayMs * 1000)
+            SecureLogger.debug("Retrying keychain save for key: \(key), attempts remaining: \(retryCount)", category: .keychain)
+            return saveDataWithResult(data, forKey: key, retryCount: retryCount - 1)
+        }
+
+        return result
+    }
+
+    /// Internal method to retrieve data with detailed result
+    private func retrieveDataWithResult(forKey key: String) -> KeychainReadResult {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        func attempt(withAccessGroup: Bool) -> OSStatus {
+            var q = base
+            if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemCopyMatching(q as CFDictionary, &result)
+        }
+
+        #if os(iOS)
+        var status = attempt(withAccessGroup: true)
+        if status == -34018 { status = attempt(withAccessGroup: false) }
+        #else
+        let status = attempt(withAccessGroup: false)
+        #endif
+
+        // Classify the result
+        let readResult = classifyReadStatus(status, data: result as? Data)
+
+        // Log all outcomes consistently
+        switch readResult {
+        case .success:
+            SecureLogger.debug("Keychain read succeeded for key: \(key)", category: .keychain)
+        case .itemNotFound:
+            // Expected case - no logging needed for missing keys
+            break
+        case .accessDenied:
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)),
+                               context: "Keychain access denied for key: \(key)", category: .keychain)
+        case .deviceLocked:
+            SecureLogger.warning("Device locked during keychain read for key: \(key)", category: .keychain)
+        case .authenticationFailed:
+            SecureLogger.warning("Authentication failed for keychain read of key: \(key)", category: .keychain)
+        case .otherError(let code):
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(code)),
+                               context: "Keychain read failed for key: \(key)", category: .keychain)
+        }
+
+        return readResult
+    }
+
+    /// Classify keychain read status into meaningful categories
+    private func classifyReadStatus(_ status: OSStatus, data: Data?) -> KeychainReadResult {
+        switch status {
+        case errSecSuccess:
+            if let data = data {
+                return .success(data)
+            }
+            return .otherError(status)
+        case errSecItemNotFound:
+            return .itemNotFound
+        case errSecInteractionNotAllowed:
+            // Device is locked or in a state that doesn't allow keychain access
+            return .deviceLocked
+        case errSecAuthFailed:
+            return .authenticationFailed
+        case -34018: // errSecMissingEntitlement
+            return .accessDenied
+        case errSecNotAvailable:
+            return .accessDenied
+        default:
+            return .otherError(status)
+        }
+    }
+
+    /// Classify keychain save status into meaningful categories
+    private func classifySaveStatus(_ status: OSStatus) -> KeychainSaveResult {
+        switch status {
+        case errSecSuccess:
+            return .success
+        case errSecDuplicateItem:
+            return .duplicateItem
+        case errSecInteractionNotAllowed:
+            return .deviceLocked
+        case -34018: // errSecMissingEntitlement
+            return .accessDenied
+        case errSecNotAvailable:
+            return .accessDenied
+        case errSecDiskFull:
+            return .storageFull
+        default:
+            return .otherError(status)
+        }
+    }
+
     // MARK: - Generic Operations
     
     private func save(_ value: String, forKey key: String) -> Bool {
@@ -173,39 +287,44 @@ class KeychainManager {
         // Delete any existing item first to ensure clean state
         _ = delete(forKey: key)
         
-        // Build query with all necessary attributes for sandboxed apps
-        var query: [String: Any] = [
+        // Build base query
+        var base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
             kSecValueData as String: data,
             kSecAttrService as String: service,
-            // Important for sandboxed apps: make it accessible when unlocked
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+            kSecAttrLabel as String: "bitchat-\(key)"
         ]
-        
-        // Add a label for easier debugging
-        query[kSecAttrLabel as String] = "bitchat-\(key)"
-        
-        // For sandboxed apps, use the app group for sharing between app instances
-        if isSandboxed() {
-            query[kSecAttrAccessGroup as String] = appGroup
-        }
-        
-        // For sandboxed macOS apps, we need to ensure the item is NOT synchronized
         #if os(macOS)
-        query[kSecAttrSynchronizable as String] = false
+        base[kSecAttrSynchronizable as String] = false
         #endif
-        
-        let status = SecItemAdd(query as CFDictionary, nil)
-        
-        if status == errSecSuccess {
-            return true
-        } else if status == -34018 {
-            SecurityLogger.logError(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: SecurityLogger.keychain)
-        } else if status != errSecDuplicateItem {
-            SecurityLogger.logError(NSError(domain: "Keychain", code: Int(status)), context: "Error saving to keychain", category: SecurityLogger.keychain)
+
+        // Try with access group where it is expected to work (iOS app builds)
+        var triedWithoutGroup = false
+        func attempt(addAccessGroup: Bool) -> OSStatus {
+            var query = base
+            if addAccessGroup { query[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemAdd(query as CFDictionary, nil)
         }
-        
+
+        #if os(iOS)
+        var status = attempt(addAccessGroup: true)
+        if status == -34018 { // Missing entitlement, retry without access group
+            triedWithoutGroup = true
+            status = attempt(addAccessGroup: false)
+        }
+        #else
+        // On macOS dev/simulator default to no access group to avoid -34018
+        let status = attempt(addAccessGroup: false)
+        #endif
+
+        if status == errSecSuccess { return true }
+        if status == -34018 && !triedWithoutGroup {
+            SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
+        } else if status != errSecDuplicateItem {
+            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)), context: "Error saving to keychain", category: .keychain)
+        }
         return false
     }
     
@@ -215,45 +334,56 @@ class KeychainManager {
     }
     
     private func retrieveData(forKey key: String) -> Data? {
-        var query: [String: Any] = [
+        // Base query
+        let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
             kSecAttrService as String: service,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
-        
-        // For sandboxed apps, use the app group
-        if isSandboxed() {
-            query[kSecAttrAccessGroup as String] = appGroup
-        }
-        
+
         var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        
-        if status == errSecSuccess {
-            return result as? Data
-        } else if status == -34018 {
-            SecurityLogger.logError(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: SecurityLogger.keychain)
+        func attempt(withAccessGroup: Bool) -> OSStatus {
+            var q = base
+            if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemCopyMatching(q as CFDictionary, &result)
         }
-        
+
+        #if os(iOS)
+        var status = attempt(withAccessGroup: true)
+        if status == -34018 { status = attempt(withAccessGroup: false) }
+        #else
+        let status = attempt(withAccessGroup: false)
+        #endif
+
+        if status == errSecSuccess { return result as? Data }
+        if status == -34018 {
+            SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
+        }
         return nil
     }
     
     private func delete(forKey key: String) -> Bool {
-        // Build basic query
-        var query: [String: Any] = [
+        // Base delete query
+        let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
             kSecAttrService as String: service
         ]
-        
-        // For sandboxed apps, use the app group
-        if isSandboxed() {
-            query[kSecAttrAccessGroup as String] = appGroup
+
+        func attempt(withAccessGroup: Bool) -> OSStatus {
+            var q = base
+            if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
+            return SecItemDelete(q as CFDictionary)
         }
-        
-        let status = SecItemDelete(query as CFDictionary)
+
+        #if os(iOS)
+        var status = attempt(withAccessGroup: true)
+        if status == -34018 { status = attempt(withAccessGroup: false) }
+        #else
+        let status = attempt(withAccessGroup: false)
+        #endif
         return status == errSecSuccess || status == errSecItemNotFound
     }
     
@@ -273,14 +403,10 @@ class KeychainManager {
         return status == errSecSuccess || status == errSecItemNotFound
     }
     
-    // Force cleanup to run again (for development/testing)
-    func resetCleanupFlag() {
-        UserDefaults.standard.removeObject(forKey: "bitchat.keychain.cleanup.v2")
-    }
-    
     
     // Delete ALL keychain data for panic mode
     func deleteAllKeychainData() -> Bool {
+        SecureLogger.warning("Panic mode - deleting all keychain data", category: .security)
         
         var totalDeleted = 0
         
@@ -299,10 +425,25 @@ class KeychainManager {
                 var shouldDelete = false
                 let account = item[kSecAttrAccount as String] as? String ?? ""
                 let service = item[kSecAttrService as String] as? String ?? ""
+                let accessGroup = item[kSecAttrAccessGroup as String] as? String
                 
-                // ONLY delete if service name contains "bitchat"
-                // This is the safest approach - we only touch items we know are ours
-                if service.lowercased().contains("bitchat") {
+                // More precise deletion criteria:
+                // 1. Check for our specific app group
+                // 2. OR check for our exact service name
+                // 3. OR check for known legacy service names
+                if accessGroup == appGroup {
+                    shouldDelete = true
+                } else if service == self.service {
+                    shouldDelete = true
+                } else if [
+                    "com.bitchat.passwords",
+                    "com.bitchat.deviceidentity",
+                    "com.bitchat.noise.identity",
+                    "chat.bitchat.passwords",
+                    "bitchat.keychain",
+                    "bitchat",
+                    "com.bitchat"
+                ].contains(service) {
                     shouldDelete = true
                 }
                 
@@ -328,18 +469,21 @@ class KeychainManager {
                     let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
                     if deleteStatus == errSecSuccess {
                         totalDeleted += 1
+                        SecureLogger.info("Deleted keychain item: \(account) from \(service)", category: .keychain)
                     }
                 }
             }
         }
         
-        // Also try to delete by known service names (in case we missed any)
+        // Also try to delete by known service names and app group
+        // This catches any items that might have been missed above
         let knownServices = [
-            "chat.bitchat",
+            self.service,  // Current service name
             "com.bitchat.passwords",
             "com.bitchat.deviceidentity", 
             "com.bitchat.noise.identity",
             "chat.bitchat.passwords",
+            "chat.bitchat.nostr",
             "bitchat.keychain",
             "bitchat",
             "com.bitchat"
@@ -357,86 +501,91 @@ class KeychainManager {
             }
         }
         
+        // Also delete by app group to ensure complete cleanup
+        let groupQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccessGroup as String: appGroup
+        ]
+        
+        let groupStatus = SecItemDelete(groupQuery as CFDictionary)
+        if groupStatus == errSecSuccess {
+            totalDeleted += 1
+        }
+        
+        SecureLogger.warning("Panic mode cleanup completed. Total items deleted: \(totalDeleted)", category: .keychain)
         
         return totalDeleted > 0
     }
     
-    // MARK: - Debug
+    // MARK: - Security Utilities
     
+    /// Securely clear sensitive data from memory
+    func secureClear(_ data: inout Data) {
+        _ = data.withUnsafeMutableBytes { bytes in
+            // Use volatile memset to prevent compiler optimization
+            memset_s(bytes.baseAddress, bytes.count, 0, bytes.count)
+        }
+        data = Data() // Clear the data object
+    }
+    
+    /// Securely clear sensitive string from memory
+    func secureClear(_ string: inout String) {
+        // Convert to mutable data and clear
+        if var data = string.data(using: .utf8) {
+            secureClear(&data)
+        }
+        string = "" // Clear the string object
+    }
+    
+    // MARK: - Debug
+
     func verifyIdentityKeyExists() -> Bool {
         let key = "identity_noiseStaticKey"
         return retrieveData(forKey: key) != nil
     }
-    
-    // Aggressive cleanup for legacy items - can be called manually
-    func aggressiveCleanupLegacyItems() -> Int {
-        var deletedCount = 0
-        
-        // List of KNOWN bitchat service names from our development history
-        let knownBitchatServices = [
-            "com.bitchat.passwords",
-            "com.bitchat.deviceidentity",
-            "com.bitchat.noise.identity",
-            "chat.bitchat.passwords",
-            "bitchat.keychain",
-            "Bitchat",
-            "BitChat"
-        ]
-        
-        // First, delete all items from known legacy services
-        for legacyService in knownBitchatServices {
-            let deleteQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: legacyService
-            ]
-            
-            let status = SecItemDelete(deleteQuery as CFDictionary)
-            if status == errSecSuccess {
-                deletedCount += 1
-            }
-        }
-        
-        // Now search for items that have our specific account patterns with bitchat service names
-        let searchQuery: [String: Any] = [
+
+    // MARK: - Generic Data Storage (consolidated from KeychainHelper)
+
+    /// Save data with a custom service name
+    func save(key: String, data: Data, service customService: String, accessible: CFString?) {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecReturnAttributes as String: true
+            kSecAttrService as String: customService,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: data
         ]
-        
-        var result: AnyObject?
-        let status = SecItemCopyMatching(searchQuery as CFDictionary, &result)
-        
-        if status == errSecSuccess, let items = result as? [[String: Any]] {
-            for item in items {
-                let account = item[kSecAttrAccount as String] as? String ?? ""
-                let service = item[kSecAttrService as String] as? String ?? ""
-                
-                // ONLY delete if service name contains "bitchat" somewhere
-                // This ensures we never touch other apps' keychain items
-                var shouldDelete = false
-                
-                // Check if service contains "bitchat" (case insensitive) but NOT our current service
-                let serviceLower = service.lowercased()
-                if service != self.service && serviceLower.contains("bitchat") {
-                    shouldDelete = true
-                }
-                
-                if shouldDelete {
-                    // Build precise delete query
-                    let deleteQuery: [String: Any] = [
-                        kSecClass as String: kSecClassGenericPassword,
-                        kSecAttrService as String: service,
-                        kSecAttrAccount as String: account
-                    ]
-                    
-                    let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
-                    if deleteStatus == errSecSuccess {
-                        deletedCount += 1
-                    }
-                }
-            }
+        if let accessible = accessible {
+            query[kSecAttrAccessible as String] = accessible
         }
-        
-        return deletedCount
+
+        SecItemDelete(query as CFDictionary)
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    /// Load data from a custom service
+    func load(key: String, service customService: String) -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: customService,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
+    /// Delete data from a custom service
+    func delete(key: String, service customService: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: customService,
+            kSecAttrAccount as String: key
+        ]
+
+        SecItemDelete(query as CFDictionary)
     }
 }

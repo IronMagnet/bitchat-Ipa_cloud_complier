@@ -7,158 +7,189 @@
 //
 
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
+#if os(macOS)
+import AppKit
+#endif
+import UniformTypeIdentifiers
+import BitLogger
+
+// MARK: - Supporting Types
+
+//
+
+//
+
+private struct MessageDisplayItem: Identifiable {
+    let id: String
+    let message: BitchatMessage
+}
+
+// MARK: - Main Content View
 
 struct ContentView: View {
+    // MARK: - Properties
+    
     @EnvironmentObject var viewModel: ChatViewModel
+    @ObservedObject private var locationManager = LocationChannelManager.shared
+    @ObservedObject private var bookmarks = GeohashBookmarksStore.shared
     @State private var messageText = ""
-    @State private var textFieldSelection: NSRange? = nil
     @FocusState private var isTextFieldFocused: Bool
     @Environment(\.colorScheme) var colorScheme
-    @State private var showPeerList = false
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showSidebar = false
-    @State private var sidebarDragOffset: CGFloat = 0
     @State private var showAppInfo = false
-    @State private var showPasswordInput = false
-    @State private var passwordInputChannel: String? = nil
-    @State private var passwordInput = ""
-    @State private var showPasswordPrompt = false
-    @State private var passwordPromptInput = ""
-    @State private var showPasswordError = false
-    @State private var showCommandSuggestions = false
-    @State private var commandSuggestions: [String] = []
-    @State private var showLeaveChannelAlert = false
-    @State private var backSwipeOffset: CGFloat = 0
-    @State private var showPrivateChat = false
-    @State private var showChannel = false
+    @State private var showMessageActions = false
+    @State private var selectedMessageSender: String?
+    @State private var selectedMessageSenderID: PeerID?
+    @FocusState private var isNicknameFieldFocused: Bool
+    @State private var isAtBottomPublic: Bool = true
+    @State private var isAtBottomPrivate: Bool = true
+    @State private var lastScrollTime: Date = .distantPast
+    @State private var scrollThrottleTimer: Timer?
+    @State private var autocompleteDebounceTimer: Timer?
+    @State private var showLocationChannelsSheet = false
+    @State private var showVerifySheet = false
+    @State private var expandedMessageIDs: Set<String> = []
+    @State private var showLocationNotes = false
+    @State private var notesGeohash: String? = nil
+    @State private var imagePreviewURL: URL? = nil
+    @State private var recordingAlertMessage: String = ""
+    @State private var showRecordingAlert = false
+    @State private var isRecordingVoiceNote = false
+    @State private var isPreparingVoiceNote = false
+    @State private var recordingDuration: TimeInterval = 0
+    @State private var recordingTimer: Timer?
+    @State private var recordingStartDate: Date?
+#if os(iOS)
+    @State private var showImagePicker = false
+    @State private var imagePickerSourceType: UIImagePickerController.SourceType = .camera
+#else
+    @State private var showMacImagePicker = false
+#endif
+    @ScaledMetric(relativeTo: .body) private var headerHeight: CGFloat = 44
+    @ScaledMetric(relativeTo: .subheadline) private var headerPeerIconSize: CGFloat = 11
+    @ScaledMetric(relativeTo: .subheadline) private var headerPeerCountFontSize: CGFloat = 12
+    // Timer-based refresh removed; use LocationChannelManager live updates instead
+    // Window sizes for rendering (infinite scroll up)
+    @State private var windowCountPublic: Int = 300
+    @State private var windowCountPrivate: [PeerID: Int] = [:]
+    
+    // MARK: - Computed Properties
     
     private var backgroundColor: Color {
         colorScheme == .dark ? Color.black : Color.white
     }
-    
+
     private var textColor: Color {
         colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
     }
-    
+
     private var secondaryTextColor: Color {
         colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
     }
+
+    private var headerLineLimit: Int? {
+        dynamicTypeSize.isAccessibilitySize ? 2 : 1
+    }
+
+    private var peopleSheetTitle: String {
+        String(localized: "content.header.people", comment: "Title for the people list sheet").lowercased()
+    }
+
+    private var peopleSheetSubtitle: String? {
+        switch locationManager.selectedChannel {
+        case .mesh:
+            return "#mesh"
+        case .location(let channel):
+            return "#\(channel.geohash.lowercased())"
+        }
+    }
+
+    private var peopleSheetActiveCount: Int {
+        switch locationManager.selectedChannel {
+        case .mesh:
+            return viewModel.allPeers.filter { $0.peerID != viewModel.meshService.myPeerID }.count
+        case .location:
+            return viewModel.visibleGeohashPeople().count
+        }
+    }
     
+    
+    private struct PrivateHeaderContext {
+        let headerPeerID: PeerID
+        let peer: BitchatPeer?
+        let displayName: String
+        let isNostrAvailable: Bool
+    }
+
+// MARK: - Body
+
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                // Base layer - Main public chat (always visible)
-                mainChatView
-                
-                // Private chat slide-over
-                if viewModel.selectedPrivateChatPeer != nil {
-                    privateChatView
-                        .frame(width: geometry.size.width)
+        VStack(spacing: 0) {
+            mainHeaderView
+                .onAppear {
+                    viewModel.currentColorScheme = colorScheme
+                    #if os(macOS)
+                    // Focus message input on macOS launch, not nickname field
+                    DispatchQueue.main.async {
+                        isNicknameFieldFocused = false
+                        isTextFieldFocused = true
+                    }
+                    #endif
+                }
+                .onChange(of: colorScheme) { newValue in
+                    viewModel.currentColorScheme = newValue
+                }
+
+            Divider()
+
+            GeometryReader { geometry in
+                VStack(spacing: 0) {
+                    messagesView(privatePeer: nil, isAtBottom: $isAtBottomPublic)
                         .background(backgroundColor)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .trailing),
-                            removal: .move(edge: .trailing)
-                        ))
-                        .offset(x: showPrivateChat ? 0 : geometry.size.width)
-                        .offset(x: backSwipeOffset)
-                        .gesture(
-                            DragGesture()
-                                .onChanged { value in
-                                    if value.translation.width > 0 {
-                                        backSwipeOffset = min(value.translation.width, geometry.size.width)
-                                    }
-                                }
-                                .onEnded { value in
-                                    if value.translation.width > 50 || (value.translation.width > 30 && value.velocity.width > 300) {
-                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                            showPrivateChat = false
-                                            backSwipeOffset = 0
-                                            viewModel.endPrivateChat()
-                                        }
-                                    } else {
-                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                            backSwipeOffset = 0
-                                        }
-                                    }
-                                }
-                        )
-                        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showPrivateChat)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                
-                // Channel slide-over
-                if viewModel.currentChannel != nil {
-                    channelView
-                        .frame(width: geometry.size.width)
-                        .background(backgroundColor)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .trailing),
-                            removal: .move(edge: .trailing)
-                        ))
-                        .offset(x: showChannel ? 0 : geometry.size.width)
-                        .offset(x: backSwipeOffset)
-                        .gesture(
-                            DragGesture()
-                                .onChanged { value in
-                                    if value.translation.width > 0 {
-                                        backSwipeOffset = min(value.translation.width, geometry.size.width)
-                                    }
-                                }
-                                .onEnded { value in
-                                    if value.translation.width > 50 || (value.translation.width > 30 && value.velocity.width > 300) {
-                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                            showChannel = false
-                                            backSwipeOffset = 0
-                                            viewModel.switchToChannel(nil)
-                                        }
-                                    } else {
-                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                            backSwipeOffset = 0
-                                        }
-                                    }
-                                }
-                        )
-                        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showChannel)
-                }
-                
-                // Sidebar overlay
-                HStack(spacing: 0) {
-                    // Tap to dismiss area
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                showSidebar = false
-                                sidebarDragOffset = 0
-                            }
-                        }
-                    
-                    sidebarView
-                        #if os(macOS)
-                        .frame(width: min(300, geometry.size.width * 0.4))
-                        #else
-                        .frame(width: geometry.size.width * 0.7)
-                        #endif
-                        .transition(.move(edge: .trailing))
-                }
-                .offset(x: showSidebar ? -sidebarDragOffset : geometry.size.width - sidebarDragOffset)
-                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showSidebar)
-                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: sidebarDragOffset)
+                .frame(width: geometry.size.width, height: geometry.size.height)
+            }
+
+            Divider()
+
+            if viewModel.selectedPrivateChatPeer == nil {
+                inputView
             }
         }
+        .background(backgroundColor)
+        .foregroundColor(textColor)
         #if os(macOS)
         .frame(minWidth: 600, minHeight: 400)
         #endif
         .onChange(of: viewModel.selectedPrivateChatPeer) { newValue in
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                showPrivateChat = newValue != nil
+            if newValue != nil {
+                showSidebar = true
             }
         }
-        .onChange(of: viewModel.currentChannel) { newValue in
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                showChannel = newValue != nil
-            }
+        .sheet(
+            isPresented: Binding(
+                get: { showSidebar || viewModel.selectedPrivateChatPeer != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        showSidebar = false
+                        viewModel.endPrivateChat()
+                    }
+                }
+            )
+        ) {
+            peopleSheetView
         }
         .sheet(isPresented: $showAppInfo) {
             AppInfoView()
+                .environmentObject(viewModel)
+                .onAppear { viewModel.isAppInfoPresented = true }
+                .onDisappear { viewModel.isAppInfoPresented = false }
         }
         .sheet(isPresented: Binding(
             get: { viewModel.showingFingerprintFor != nil },
@@ -166,131 +197,291 @@ struct ContentView: View {
         )) {
             if let peerID = viewModel.showingFingerprintFor {
                 FingerprintView(viewModel: viewModel, peerID: peerID)
+                    .environmentObject(viewModel)
             }
         }
-        .alert("Set Channel Password", isPresented: $showPasswordInput) {
-            SecureField("Password", text: $passwordInput)
-            Button("Cancel", role: .cancel) {
-                passwordInput = ""
-                passwordInputChannel = nil
-            }
-            Button("Set Password") {
-                if let channel = passwordInputChannel, !passwordInput.isEmpty {
-                    viewModel.setChannelPassword(passwordInput, for: channel)
-                    passwordInput = ""
-                    passwordInputChannel = nil
+#if os(iOS)
+        // Only present image picker from main view when NOT in a sheet
+        .fullScreenCover(isPresented: Binding(
+            get: { showImagePicker && !showSidebar && viewModel.selectedPrivateChatPeer == nil },
+            set: { newValue in
+                if !newValue {
+                    showImagePicker = false
                 }
             }
-        } message: {
-            Text("Enter a password to protect \(passwordInputChannel ?? "channel"). Others will need this password to read messages.")
-        }
-        .alert("Enter Channel Password", isPresented: Binding(
-            get: { viewModel.showPasswordPrompt },
-            set: { viewModel.showPasswordPrompt = $0 }
         )) {
-            SecureField("Password", text: $passwordPromptInput)
-            Button("Cancel", role: .cancel) {
-                passwordPromptInput = ""
-                viewModel.passwordPromptChannel = nil
-            }
-            Button("Join") {
-                if let channel = viewModel.passwordPromptChannel, !passwordPromptInput.isEmpty {
-                    let success = viewModel.joinChannel(channel, password: passwordPromptInput)
-                    if success {
-                        passwordPromptInput = ""
-                    } else {
-                        // Wrong password - show error
-                        passwordPromptInput = ""
-                        showPasswordError = true
+            ImagePickerView(sourceType: imagePickerSourceType) { image in
+                showImagePicker = false
+                if let image = image {
+                    Task {
+                        do {
+                            let processedURL = try ImageUtils.processImage(image)
+                            await MainActor.run {
+                                viewModel.sendImage(from: processedURL)
+                            }
+                        } catch {
+                            SecureLogger.error("Image processing failed: \(error)", category: .session)
+                        }
                     }
                 }
             }
-        } message: {
-            Text("Channel \(viewModel.passwordPromptChannel ?? "") is password protected. Enter the password to join.")
+            .environmentObject(viewModel)
+            .ignoresSafeArea()
         }
-        .alert("Wrong Password", isPresented: $showPasswordError) {
-            Button("OK", role: .cancel) { }
+#endif
+#if os(macOS)
+        // Only present Mac image picker from main view when NOT in a sheet
+        .sheet(isPresented: Binding(
+            get: { showMacImagePicker && !showSidebar && viewModel.selectedPrivateChatPeer == nil },
+            set: { newValue in
+                if !newValue {
+                    showMacImagePicker = false
+                }
+            }
+        )) {
+            MacImagePickerView { url in
+                showMacImagePicker = false
+                if let url = url {
+                    Task {
+                        do {
+                            let processedURL = try ImageUtils.processImage(at: url)
+                            await MainActor.run {
+                                viewModel.sendImage(from: processedURL)
+                            }
+                        } catch {
+                            SecureLogger.error("Image processing failed: \(error)", category: .session)
+                        }
+                    }
+                }
+            }
+            .environmentObject(viewModel)
+        }
+#endif
+        .sheet(isPresented: Binding(
+            get: { imagePreviewURL != nil },
+            set: { presenting in if !presenting { imagePreviewURL = nil } }
+        )) {
+            if let url = imagePreviewURL {
+                ImagePreviewView(url: url)
+                    .environmentObject(viewModel)
+            }
+        }
+        .alert("Recording Error", isPresented: $showRecordingAlert, actions: {
+            Button("OK", role: .cancel) {}
+        }, message: {
+            Text(recordingAlertMessage)
+        })
+        .confirmationDialog(
+            selectedMessageSender.map { "@\($0)" } ?? String(localized: "content.actions.title", comment: "Fallback title for the message action sheet"),
+            isPresented: $showMessageActions,
+            titleVisibility: .visible
+        ) {
+            Button("content.actions.mention") {
+                if let sender = selectedMessageSender {
+                    // Pre-fill the input with an @mention and focus the field
+                    messageText = "@\(sender) "
+                    isTextFieldFocused = true
+                }
+            }
+
+            Button("content.actions.direct_message") {
+                if let peerID = selectedMessageSenderID {
+                    if peerID.isGeoChat {
+                        if let full = viewModel.fullNostrHex(forSenderPeerID: peerID) {
+                            viewModel.startGeohashDM(withPubkeyHex: full)
+                        }
+                    } else {
+                        viewModel.startPrivateChat(with: peerID)
+                    }
+                    withAnimation(.easeInOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
+                        showSidebar = true
+                    }
+                }
+            }
+
+            Button("content.actions.hug") {
+                if let sender = selectedMessageSender {
+                    viewModel.sendMessage("/hug @\(sender)")
+                }
+            }
+
+            Button("content.actions.slap") {
+                if let sender = selectedMessageSender {
+                    viewModel.sendMessage("/slap @\(sender)")
+                }
+            }
+
+            Button("content.actions.block", role: .destructive) {
+                // Prefer direct geohash block when we have a Nostr sender ID
+                if let peerID = selectedMessageSenderID, peerID.isGeoChat,
+                   let full = viewModel.fullNostrHex(forSenderPeerID: peerID),
+                   let sender = selectedMessageSender {
+                    viewModel.blockGeohashUser(pubkeyHexLowercased: full, displayName: sender)
+                } else if let sender = selectedMessageSender {
+                    viewModel.sendMessage("/block \(sender)")
+                }
+            }
+
+            Button("common.cancel", role: .cancel) {}
+        }
+        .alert("content.alert.bluetooth_required.title", isPresented: $viewModel.showBluetoothAlert) {
+            Button("content.alert.bluetooth_required.settings") {
+                #if os(iOS)
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+                #endif
+            }
+            Button("common.ok", role: .cancel) {}
         } message: {
-            Text("The password you entered is incorrect. Please try again.")
+            Text(viewModel.bluetoothAlertMessage)
+        }
+        .onDisappear {
+            // Clean up timers
+            scrollThrottleTimer?.invalidate()
+            autocompleteDebounceTimer?.invalidate()
         }
     }
     
-    private func messagesView(for channel: String?, privatePeer: String?) -> some View {
-        ScrollViewReader { proxy in
+    // MARK: - Message List View
+    
+    private func messagesView(privatePeer: PeerID?, isAtBottom: Binding<Bool>) -> some View {
+        let messages: [BitchatMessage] = {
+            if let peerID = privatePeer {
+                return viewModel.getPrivateChatMessages(for: peerID)
+            }
+            return viewModel.messages
+        }()
+
+        let currentWindowCount: Int = {
+            if let peer = privatePeer {
+                return windowCountPrivate[peer] ?? TransportConfig.uiWindowInitialCountPrivate
+            }
+            return windowCountPublic
+        }()
+
+        let windowedMessages: [BitchatMessage] = Array(messages.suffix(currentWindowCount))
+
+        let contextKey: String = {
+            if let peer = privatePeer { return "dm:\(peer)" }
+            switch locationManager.selectedChannel {
+            case .mesh: return "mesh"
+            case .location(let ch): return "geo:\(ch.geohash)"
+            }
+        }()
+
+        let messageItems: [MessageDisplayItem] = windowedMessages.compactMap { message in
+            let trimmed = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return MessageDisplayItem(id: "\(contextKey)|\(message.id)", message: message)
+        }
+
+        return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    let messages: [BitchatMessage] = {
-                        if let privatePeer = privatePeer {
-                            let msgs = viewModel.getPrivateChatMessages(for: privatePeer)
-                            return msgs
-                        } else if let channel = channel {
-                            let msgs = viewModel.getChannelMessages(channel)
-                            return msgs
-                        } else {
-                            return viewModel.messages
-                        }
-                    }()
-                    
-                    ForEach(messages, id: \.id) { message in
-                        VStack(alignment: .leading, spacing: 4) {
-                            // Check if current user is mentioned
-                            let _ = message.mentions?.contains(viewModel.nickname) ?? false
-                            
-                            if message.sender == "system" {
-                                // System messages
-                                Text(viewModel.formatMessageAsText(message, colorScheme: colorScheme))
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            } else {
-                                // Regular messages with natural text wrapping
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack(alignment: .top, spacing: 0) {
-                                        // Single text view for natural wrapping
-                                        Text(viewModel.formatMessageAsText(message, colorScheme: colorScheme))
-                                            .textSelection(.enabled)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                        
-                                        // Delivery status indicator for private messages
-                                        if message.isPrivate && message.sender == viewModel.nickname,
-                                           let status = message.deliveryStatus {
-                                            DeliveryStatusView(status: status, colorScheme: colorScheme)
-                                                .padding(.leading, 4)
-                                        }
-                                    }
-                                    
-                                    // Check for links and show preview
-                                    if let markdownLink = message.content.extractMarkdownLink() {
-                                        // Don't show link preview if the message is just the emoji
-                                        let cleanContent = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        if cleanContent.hasPrefix("👇") {
-                                            LinkPreviewView(url: markdownLink.url, title: markdownLink.title)
-                                                .padding(.top, 4)
-                                        }
-                                    } else {
-                                        // Check for plain URLs
-                                        let urls = message.content.extractURLs()
-                                        ForEach(urls.prefix(3), id: \.url) { urlInfo in
-                                            LinkPreviewView(url: urlInfo.url, title: nil)
-                                                .padding(.top, 4)
-                                        }
-                                    }
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(messageItems) { item in
+                        let message = item.message
+                        messageRow(for: message)
+                            .onAppear {
+                                if message.id == windowedMessages.last?.id {
+                                    isAtBottom.wrappedValue = true
+                                }
+                                if message.id == windowedMessages.first?.id,
+                                   messages.count > windowedMessages.count {
+                                    expandWindow(
+                                        ifNeededFor: message,
+                                        allMessages: messages,
+                                        privatePeer: privatePeer,
+                                        proxy: proxy
+                                    )
                                 }
                             }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 2)
-                        .id(message.id)
+                            .onDisappear {
+                                if message.id == windowedMessages.last?.id {
+                                    isAtBottom.wrappedValue = false
+                                }
+                            }
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if message.sender != "system" {
+                                    messageText = "@\(message.sender) "
+                                    isTextFieldFocused = true
+                                }
+                            }
+                            .contextMenu {
+                                Button("content.message.copy") {
+                                    #if os(iOS)
+                                    UIPasteboard.general.string = message.content
+                                    #else
+                                    let pb = NSPasteboard.general
+                                    pb.clearContents()
+                                    pb.setString(message.content, forType: .string)
+                                    #endif
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 1)
                     }
                 }
-                .padding(.vertical, 8)
+                .transaction { tx in if viewModel.isBatchingPublic { tx.disablesAnimations = true } }
+                .padding(.vertical, 2)
             }
             .background(backgroundColor)
+            .onOpenURL { handleOpenURL($0) }
+            .onTapGesture(count: 3) {
+                viewModel.sendMessage("/clear")
+            }
+            .onAppear {
+                scrollToBottom(on: proxy, privatePeer: privatePeer, isAtBottom: isAtBottom)
+            }
+            .onChange(of: privatePeer) { _ in
+                scrollToBottom(on: proxy, privatePeer: privatePeer, isAtBottom: isAtBottom)
+            }
             .onChange(of: viewModel.messages.count) { _ in
-                if channel == nil && privatePeer == nil && !viewModel.messages.isEmpty {
-                    withAnimation {
-                        proxy.scrollTo(viewModel.messages.last?.id, anchor: .bottom)
+                if privatePeer == nil && !viewModel.messages.isEmpty {
+                    // If the newest message is from me, always scroll to bottom
+                    let lastMsg = viewModel.messages.last!
+                    let isFromSelf = (lastMsg.sender == viewModel.nickname) || lastMsg.sender.hasPrefix(viewModel.nickname + "#")
+                    if !isFromSelf {
+                        // Only autoscroll when user is at/near bottom
+                        guard isAtBottom.wrappedValue else { return }
+                    } else {
+                        // Ensure we consider ourselves at bottom for subsequent messages
+                        isAtBottom.wrappedValue = true
+                    }
+                    // Throttle scroll animations to prevent excessive UI updates
+                    let now = Date()
+                    if now.timeIntervalSince(lastScrollTime) > TransportConfig.uiScrollThrottleSeconds {
+                        // Immediate scroll if enough time has passed
+                        lastScrollTime = now
+                        let contextKey: String = {
+                            switch locationManager.selectedChannel {
+                            case .mesh: return "mesh"
+                            case .location(let ch): return "geo:\(ch.geohash)"
+                            }
+                        }()
+                        let count = windowCountPublic
+                        let target = viewModel.messages.suffix(count).last.map { "\(contextKey)|\($0.id)" }
+                        DispatchQueue.main.async {
+                            if let target = target { proxy.scrollTo(target, anchor: .bottom) }
+                        }
+                    } else {
+                        // Schedule a delayed scroll
+                        scrollThrottleTimer?.invalidate()
+                        scrollThrottleTimer = Timer.scheduledTimer(withTimeInterval: TransportConfig.uiScrollThrottleSeconds, repeats: false) { [weak viewModel] _ in
+                            Task { @MainActor in
+                                lastScrollTime = Date()
+                                let contextKey: String = {
+                                    switch locationManager.selectedChannel {
+                                    case .mesh: return "mesh"
+                                    case .location(let ch): return "geo:\(ch.geohash)"
+                                    }
+                                }()
+                                let count = windowCountPublic
+                                let target = viewModel?.messages.suffix(count).last.map { "\(contextKey)|\($0.id)" }
+                                if let target = target { proxy.scrollTo(target, anchor: .bottom) }
+                            }
+                        }
                     }
                 }
             }
@@ -298,17 +489,54 @@ struct ContentView: View {
                 if let peerID = privatePeer,
                    let messages = viewModel.privateChats[peerID],
                    !messages.isEmpty {
-                    withAnimation {
-                        proxy.scrollTo(messages.last?.id, anchor: .bottom)
+                    // If the newest private message is from me, always scroll
+                    let lastMsg = messages.last!
+                    let isFromSelf = (lastMsg.sender == viewModel.nickname) || lastMsg.sender.hasPrefix(viewModel.nickname + "#")
+                    if !isFromSelf {
+                        // Only autoscroll when user is at/near bottom
+                        guard isAtBottom.wrappedValue else { return }
+                    } else {
+                        isAtBottom.wrappedValue = true
+                    }
+                    // Same throttling for private chats
+                    let now = Date()
+                    if now.timeIntervalSince(lastScrollTime) > TransportConfig.uiScrollThrottleSeconds {
+                        lastScrollTime = now
+                        let contextKey = "dm:\(peerID)"
+                        let count = windowCountPrivate[peerID] ?? 300
+                        let target = messages.suffix(count).last.map { "\(contextKey)|\($0.id)" }
+                        DispatchQueue.main.async {
+                            if let target = target { proxy.scrollTo(target, anchor: .bottom) }
+                        }
+                    } else {
+                        scrollThrottleTimer?.invalidate()
+                        scrollThrottleTimer = Timer.scheduledTimer(withTimeInterval: TransportConfig.uiScrollThrottleSeconds, repeats: false) { _ in
+                            lastScrollTime = Date()
+                            let contextKey = "dm:\(peerID)"
+                            let count = windowCountPrivate[peerID] ?? 300
+                            let target = messages.suffix(count).last.map { "\(contextKey)|\($0.id)" }
+                            DispatchQueue.main.async {
+                                if let target = target { proxy.scrollTo(target, anchor: .bottom) }
+                            }
+                        }
                     }
                 }
             }
-            .onChange(of: viewModel.channelMessages) { _ in
-                if let channelName = channel,
-                   let messages = viewModel.channelMessages[channelName],
-                   !messages.isEmpty {
-                    withAnimation {
-                        proxy.scrollTo(messages.last?.id, anchor: .bottom)
+            .onChange(of: locationManager.selectedChannel) { newChannel in
+                // When switching to a new geohash channel, scroll to the bottom
+                guard privatePeer == nil else { return }
+                switch newChannel {
+                case .mesh:
+                    break
+                case .location(let ch):
+                    // Reset window size
+                    windowCountPublic = TransportConfig.uiWindowInitialCountPublic
+                    let contextKey = "geo:\(ch.geohash)"
+                    let last = viewModel.messages.suffix(windowCountPublic).last?.id
+                    let target = last.map { "\(contextKey)|\($0)" }
+                    isAtBottom.wrappedValue = true
+                    DispatchQueue.main.async {
+                        if let target = target { proxy.scrollTo(target, anchor: .bottom) }
                     }
                 }
             }
@@ -318,30 +546,46 @@ struct ContentView: View {
                     // Try multiple times to ensure read receipts are sent
                     viewModel.markPrivateMessagesAsRead(from: peerID)
                     
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + TransportConfig.uiReadReceiptRetryShortSeconds) {
                         viewModel.markPrivateMessagesAsRead(from: peerID)
                     }
                     
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + TransportConfig.uiReadReceiptRetryLongSeconds) {
                         viewModel.markPrivateMessagesAsRead(from: peerID)
                     }
                 }
             }
         }
+        .environment(\.openURL, OpenURLAction { url in
+            // Intercept custom cashu: links created in attributed text
+            if let scheme = url.scheme?.lowercased(), scheme == "cashu" || scheme == "lightning" {
+                #if os(iOS)
+                UIApplication.shared.open(url)
+                return .handled
+                #else
+                // On non-iOS platforms, let the system handle or ignore
+                return .systemAction
+                #endif
+            }
+            return .systemAction
+        })
     }
     
+    // MARK: - Input View
+
+    @ViewBuilder
     private var inputView: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 6) {
             // @mentions autocomplete
             if viewModel.showAutocomplete && !viewModel.autocompleteSuggestions.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(viewModel.autocompleteSuggestions.enumerated()), id: \.element) { index, suggestion in
+                    ForEach(Array(viewModel.autocompleteSuggestions.prefix(4)), id: \.self) { suggestion in
                         Button(action: {
                             _ = viewModel.completeNickname(suggestion, in: &messageText)
                         }) {
                             HStack {
-                                Text("@\(suggestion)")
-                                    .font(.system(size: 11, design: .monospaced))
+                                Text(suggestion)
+                                    .font(.bitchatSystem(size: 11, design: .monospaced))
                                     .foregroundColor(textColor)
                                     .fontWeight(.medium)
                                 Spacer()
@@ -361,607 +605,604 @@ struct ContentView: View {
                 )
                 .padding(.horizontal, 12)
             }
-            
-            // Command suggestions
-            if showCommandSuggestions && !commandSuggestions.isEmpty {
-                VStack(alignment: .leading, spacing: 0) {
-                    // Define commands with aliases and syntax
-                    let commandInfo: [(commands: [String], syntax: String?, description: String)] = [
-                        (["/block"], "[nickname]", "block or list blocked peers"),
-                        (["/clear"], nil, "clear chat messages"),
-                        (["/hug"], "<nickname>", "send someone a warm hug"),
-                        (["/j", "/join"], "<channel>", "join or create a channel"),
-                        (["/m", "/msg"], "<nickname> [message]", "send private message"),
-                        (["/channels"], nil, "show all discovered channels"),
-                        (["/slap"], "<nickname>", "slap someone with a trout"),
-                        (["/unblock"], "<nickname>", "unblock a peer"),
-                        (["/w"], nil, "see who's online")
-                    ]
-                    
-                    let channelCommandInfo: [(commands: [String], syntax: String?, description: String)] = [
-                        (["/pass"], "[password]", "change channel password"),
-                        (["/transfer"], "<nickname>", "transfer channel ownership")
-                    ]
-                    
-                    // Build the display
-                    let allCommands = viewModel.currentChannel != nil 
-                        ? commandInfo + channelCommandInfo 
-                        : commandInfo
-                    
-                    // Show matching commands
-                    ForEach(commandSuggestions, id: \.self) { command in
-                        // Find the command info for this suggestion
-                        if let info = allCommands.first(where: { $0.commands.contains(command) }) {
-                            Button(action: {
-                                // Replace current text with selected command
-                                messageText = command + " "
-                                showCommandSuggestions = false
-                                commandSuggestions = []
-                            }) {
-                                HStack {
-                                    // Show all aliases together
-                                    Text(info.commands.joined(separator: ", "))
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(textColor)
-                                        .fontWeight(.medium)
-                                    
-                                    // Show syntax if any
-                                    if let syntax = info.syntax {
-                                        Text(syntax)
-                                            .font(.system(size: 10, design: .monospaced))
-                                            .foregroundColor(secondaryTextColor.opacity(0.8))
-                                    }
-                                    
-                                    Spacer()
-                                    
-                                    // Show description
-                                    Text(info.description)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundColor(secondaryTextColor)
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 3)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .buttonStyle(.plain)
-                            .background(Color.gray.opacity(0.1))
-                        }
-                    }
-                }
-                .background(backgroundColor)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(secondaryTextColor.opacity(0.3), lineWidth: 1)
-                )
-                .padding(.horizontal, 12)
+
+            CommandSuggestionsView(
+                messageText: $messageText,
+                textColor: textColor,
+                backgroundColor: backgroundColor,
+                secondaryTextColor: secondaryTextColor
+            )
+
+            // Recording indicator
+            if isPreparingVoiceNote || isRecordingVoiceNote {
+                recordingIndicator
             }
-            
+
             HStack(alignment: .center, spacing: 4) {
-            if viewModel.selectedPrivateChatPeer != nil {
-                Text("<@\(viewModel.nickname)> →")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color.orange)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.leading, 12)
-            } else if let currentChannel = viewModel.currentChannel, viewModel.passwordProtectedChannels.contains(currentChannel) {
-                Text("<@\(viewModel.nickname)> →")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color.orange)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.leading, 12)
-            } else {
-                Text("<@\(viewModel.nickname)>")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(textColor)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.leading, 12)
-            }
-            
-            TextField("", text: $messageText)
+                TextField(
+                    "",
+                    text: $messageText,
+                    prompt: Text(
+                        String(localized: "content.input.message_placeholder", comment: "Placeholder shown in the chat composer")
+                    )
+                    .foregroundColor(secondaryTextColor.opacity(0.6))
+                )
                 .textFieldStyle(.plain)
-                .font(.system(size: 14, design: .monospaced))
+                .font(.bitchatSystem(size: 15, design: .monospaced))
                 .foregroundColor(textColor)
-                .autocorrectionDisabled()
                 .focused($isTextFieldFocused)
+                .autocorrectionDisabled(true)
+#if os(iOS)
+                .textInputAutocapitalization(.sentences)
+#endif
+                .submitLabel(.send)
+                .onSubmit { sendMessage() }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(colorScheme == .dark ? Color.black.opacity(0.35) : Color.white.opacity(0.7))
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .onChange(of: messageText) { newValue in
-                    // Get cursor position (approximate - end of text for now)
-                    let cursorPosition = newValue.count
-                    viewModel.updateAutocomplete(for: newValue, cursorPosition: cursorPosition)
-                    
-                    // Check for command autocomplete
-                    if newValue.hasPrefix("/") && newValue.count >= 1 {
-                        // Build context-aware command list
-                        var commandDescriptions = [
-                            ("/block", "block or list blocked peers"),
-                            ("/channels", "show all discovered channels"),
-                            ("/clear", "clear chat messages"),
-                            ("/hug", "send someone a warm hug"),
-                            ("/j", "join or create a channel"),
-                            ("/m", "send private message"),
-                            ("/slap", "slap someone with a trout"),
-                            ("/unblock", "unblock a peer"),
-                            ("/w", "see who's online")
-                        ]
-                        
-                        // Add channel-specific commands if in a channel
-                        if viewModel.currentChannel != nil {
-                            commandDescriptions.append(("/pass", "change channel password"))
-                            commandDescriptions.append(("/transfer", "transfer channel ownership"))
+                    autocompleteDebounceTimer?.invalidate()
+                    autocompleteDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak viewModel] _ in
+                        let cursorPosition = newValue.count
+                        Task { @MainActor in
+                            viewModel?.updateAutocomplete(for: newValue, cursorPosition: cursorPosition)
                         }
-                        
-                        let input = newValue.lowercased()
-                        
-                        // Map of aliases to primary commands
-                        let aliases: [String: String] = [
-                            "/join": "/j",
-                            "/msg": "/m"
-                        ]
-                        
-                        // Filter commands, but convert aliases to primary
-                        commandSuggestions = commandDescriptions
-                            .filter { $0.0.starts(with: input) }
-                            .map { $0.0 }
-                        
-                        // Also check if input matches an alias
-                        for (alias, primary) in aliases {
-                            if alias.starts(with: input) && !commandSuggestions.contains(primary) {
-                                if commandDescriptions.contains(where: { $0.0 == primary }) {
-                                    commandSuggestions.append(primary)
-                                }
-                            }
-                        }
-                        
-                        // Remove duplicates and sort
-                        commandSuggestions = Array(Set(commandSuggestions)).sorted()
-                        showCommandSuggestions = !commandSuggestions.isEmpty
-                    } else {
-                        showCommandSuggestions = false
-                        commandSuggestions = []
                     }
                 }
-                .onSubmit {
-                    sendMessage()
+
+                HStack(alignment: .center, spacing: 4) {
+                    if shouldShowMediaControls {
+                        attachmentButton
+                    }
+
+                    sendOrMicButton
                 }
-            
-            Button(action: sendMessage) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 20))
-                    .foregroundColor(messageText.isEmpty ? Color.gray :
-                                            (viewModel.selectedPrivateChatPeer != nil ||
-                                             (viewModel.currentChannel != nil && viewModel.passwordProtectedChannels.contains(viewModel.currentChannel ?? "")))
-                                             ? Color.orange : textColor)
             }
-            .buttonStyle(.plain)
-            .padding(.trailing, 12)
-            .accessibilityLabel("Send message")
-            .accessibilityHint(messageText.isEmpty ? "Enter a message to send" : "Double tap to send")
-            }
-            .padding(.vertical, 8)
-            .background(backgroundColor.opacity(0.95))
         }
-        .onAppear {
-            isTextFieldFocused = true
+        .padding(.horizontal, 6)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .background(backgroundColor.opacity(0.95))
+    }
+    
+    private func handleOpenURL(_ url: URL) {
+        guard url.scheme == "bitchat" else { return }
+        switch url.host {
+        case "user":
+            let id = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let peerID = PeerID(str: id.removingPercentEncoding ?? id)
+            selectedMessageSenderID = peerID
+
+            if peerID.isGeoDM || peerID.isGeoChat {
+                selectedMessageSender = viewModel.geohashDisplayName(for: peerID)
+            } else if let name = viewModel.meshService.peerNickname(peerID: peerID) {
+                selectedMessageSender = name
+            } else {
+                selectedMessageSender = viewModel.messages.last(where: { $0.senderPeerID == peerID && $0.sender != "system" })?.sender
+            }
+
+            if viewModel.isSelfSender(peerID: peerID, displayName: selectedMessageSender) {
+                selectedMessageSender = nil
+                selectedMessageSenderID = nil
+            } else {
+                showMessageActions = true
+            }
+
+        case "geohash":
+            let gh = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+            let allowed = Set("0123456789bcdefghjkmnpqrstuvwxyz")
+            guard (2...12).contains(gh.count), gh.allSatisfy({ allowed.contains($0) }) else { return }
+
+            func levelForLength(_ len: Int) -> GeohashChannelLevel {
+                switch len {
+                case 0...2: return .region
+                case 3...4: return .province
+                case 5: return .city
+                case 6: return .neighborhood
+                case 7: return .block
+                default: return .block
+                }
+            }
+
+            let level = levelForLength(gh.count)
+            let channel = GeohashChannel(level: level, geohash: gh)
+
+            let inRegional = LocationChannelManager.shared.availableChannels.contains { $0.geohash == gh }
+            if !inRegional && !LocationChannelManager.shared.availableChannels.isEmpty {
+                LocationChannelManager.shared.markTeleported(for: gh, true)
+            }
+            LocationChannelManager.shared.select(ChannelID.location(channel))
+
+        default:
+            return
         }
     }
+
+    private func scrollToBottom(on proxy: ScrollViewProxy,
+                                privatePeer: PeerID?,
+                                isAtBottom: Binding<Bool>) {
+        let targetID: String? = {
+            if let peer = privatePeer,
+               let last = viewModel.getPrivateChatMessages(for: peer).suffix(300).last?.id {
+                return "dm:\(peer)|\(last)"
+            }
+            let contextKey: String = {
+                switch locationManager.selectedChannel {
+                case .mesh: return "mesh"
+                case .location(let ch): return "geo:\(ch.geohash)"
+                }
+            }()
+            if let last = viewModel.messages.suffix(300).last?.id {
+                return "\(contextKey)|\(last)"
+            }
+            return nil
+        }()
+
+        isAtBottom.wrappedValue = true
+
+        DispatchQueue.main.async {
+            if let targetID {
+                proxy.scrollTo(targetID, anchor: .bottom)
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            let secondTarget: String? = {
+                if let peer = privatePeer,
+                   let last = viewModel.getPrivateChatMessages(for: peer).suffix(300).last?.id {
+                    return "dm:\(peer)|\(last)"
+                }
+                let contextKey: String = {
+                    switch locationManager.selectedChannel {
+                    case .mesh: return "mesh"
+                    case .location(let ch): return "geo:\(ch.geohash)"
+                    }
+                }()
+                if let last = viewModel.messages.suffix(300).last?.id {
+                    return "\(contextKey)|\(last)"
+                }
+                return nil
+            }()
+
+            if let secondTarget {
+                proxy.scrollTo(secondTarget, anchor: .bottom)
+            }
+        }
+    }
+    // MARK: - Actions
     
     private func sendMessage() {
-        viewModel.sendMessage(messageText)
+        let trimmed = trimmedMessageText
+        guard !trimmed.isEmpty else { return }
+
+        // Clear input immediately for instant feedback
         messageText = ""
-    }
-    
-    @ViewBuilder
-    private var channelsSection: some View {
-        if !viewModel.joinedChannels.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 4) {
-                    Image(systemName: "square.split.2x2")
-                        .font(.system(size: 10))
-                        .accessibilityHidden(true)
-                    Text("CHANNELS")
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                }
-                .foregroundColor(secondaryTextColor)
-                .padding(.horizontal, 12)
-                
-                ForEach(Array(viewModel.joinedChannels).sorted(), id: \.self) { channel in
-                    channelButton(for: channel)
-                }
-            }
+
+        // Defer actual send to next runloop to avoid blocking
+        DispatchQueue.main.async {
+            self.viewModel.sendMessage(trimmed)
         }
     }
     
-    @ViewBuilder
-    private func channelButton(for channel: String) -> some View {
-        Button(action: {
-            // Check if channel needs password and we don't have it
-            if viewModel.passwordProtectedChannels.contains(channel) && viewModel.channelKeys[channel] == nil {
-                // Need password
-                viewModel.passwordPromptChannel = channel
-                viewModel.showPasswordPrompt = true
+    // MARK: - Sheet Content
+    
+    private var peopleSheetView: some View {
+        Group {
+            if viewModel.selectedPrivateChatPeer != nil {
+                privateChatSheetView
             } else {
-                // Can enter channel
-                viewModel.switchToChannel(channel)
-                withAnimation(.spring()) {
-                    showSidebar = false
-                }
+                peopleListSheetView
             }
-        }) {
-            HStack {
-                // Lock icon for password protected channels
-                if viewModel.passwordProtectedChannels.contains(channel) {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 10))
-                        .foregroundColor(secondaryTextColor)
-                        .accessibilityLabel("Password protected")
-                }
-                
-                Text(channel)
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(viewModel.currentChannel == channel ? Color.blue : textColor)
-                
-                Spacer()
-                
-                // Unread count
-                if let unreadCount = viewModel.unreadChannelMessages[channel], unreadCount > 0 {
-                    Text("\(unreadCount)")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundColor(backgroundColor)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.orange)
-                        .clipShape(Capsule())
-                }
-                
-                // Channel controls
-                if viewModel.currentChannel == channel {
-                    channelControls(for: channel)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
-        .background(viewModel.currentChannel == channel ? backgroundColor.opacity(0.5) : Color.clear)
-    }
-    
-    @ViewBuilder
-    private func channelControls(for channel: String) -> some View {
-        HStack(spacing: 4) {
-            // Password button for channel creator only
-            if viewModel.isChannelOwner(channel) {
-                Button(action: {
-                    // Toggle password protection
-                    if viewModel.passwordProtectedChannels.contains(channel) {
-                        viewModel.removeChannelPassword(for: channel)
-                    } else {
-                        // Show password input
-                        showPasswordInput = true
-                        passwordInputChannel = channel
-                    }
-                }) {
-                    HStack(spacing: 2) {
-                        Image(systemName: viewModel.passwordProtectedChannels.contains(channel) ? "lock.fill" : "lock")
-                            .font(.system(size: 10))
-                    }
-                    .foregroundColor(viewModel.passwordProtectedChannels.contains(channel) ? backgroundColor : secondaryTextColor)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(viewModel.passwordProtectedChannels.contains(channel) ? Color.orange : Color.clear)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 4)
-                            .stroke(viewModel.passwordProtectedChannels.contains(channel) ? Color.orange : secondaryTextColor.opacity(0.5), lineWidth: 1)
-                    )
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(viewModel.passwordProtectedChannels.contains(channel) ? "Remove password" : "Set password")
-            }
-            
-            // Leave button
-            Button(action: {
-                showLeaveChannelAlert = true
-            }) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 14))
-                    .foregroundColor(Color.red.opacity(0.6))
-            }
-            .buttonStyle(.plain)
-            .alert("leave channel", isPresented: $showLeaveChannelAlert) {
-                Button("cancel", role: .cancel) { }
-                Button("leave", role: .destructive) {
-                    viewModel.leaveChannel(channel)
-                }
-            } message: {
-                Text("sure you want to leave \(channel)?")
-            }
-        }
-    }
-    
-    private var sidebarView: some View {
-        HStack(spacing: 0) {
-            // Grey vertical bar for visual continuity
-            Rectangle()
-                .fill(Color.gray.opacity(0.3))
-                .frame(width: 1)
-            
-            VStack(alignment: .leading, spacing: 0) {
-                // Header - match main toolbar height
-                HStack {
-                    Text("YOUR NETWORK")
-                        .font(.system(size: 16, weight: .bold, design: .monospaced))
-                        .foregroundColor(textColor)
-                    Spacer()
-                }
-                .frame(height: 44) // Match header height
-                .padding(.horizontal, 12)
-                .background(backgroundColor.opacity(0.95))
-                
-                Divider()
-            
-            // Rooms and People list
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Channels section
-                    channelsSection
-                    
-                    if !viewModel.joinedChannels.isEmpty {
-                        Divider()
-                            .padding(.vertical, 4)
-                    }
-                    
-                    // People section
-                    VStack(alignment: .leading, spacing: 8) {
-                        // Show appropriate header based on context
-                        if let currentChannel = viewModel.currentChannel {
-                            Text("IN \(currentChannel.uppercased())")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal, 12)
-                        } else if !viewModel.connectedPeers.isEmpty {
-                            HStack(spacing: 4) {
-                                Image(systemName: "person.2.fill")
-                                    .font(.system(size: 10))
-                                    .accessibilityHidden(true)
-                                Text("PEOPLE")
-                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            }
-                            .foregroundColor(secondaryTextColor)
-                            .padding(.horizontal, 12)
-                        }
-                        
-                        if viewModel.connectedPeers.isEmpty {
-                            Text("no one connected...")
-                                .font(.system(size: 14, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal)
-                        } else if let currentChannel = viewModel.currentChannel,
-                                  let channelMemberIDs = viewModel.channelMembers[currentChannel],
-                                  channelMemberIDs.isEmpty {
-                            Text("no one in this channel yet...")
-                                .font(.system(size: 14, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal)
-                        } else {
-                            let peerNicknames = viewModel.meshService.getPeerNicknames()
-                            let peerRSSI = viewModel.meshService.getPeerRSSI()
-                            let myPeerID = viewModel.meshService.myPeerID
-                            
-                            // Filter peers based on current channel
-                            let peersToShow: [String] = {
-                                if let currentChannel = viewModel.currentChannel,
-                                   let channelMemberIDs = viewModel.channelMembers[currentChannel] {
-                                    // Show only peers who have sent messages to this channel (including self)
-                                    
-                                    // Start with channel members who are also connected
-                                    var memberPeers = viewModel.connectedPeers.filter { channelMemberIDs.contains($0) }
-                                    
-                                    // Always include ourselves if we're a channel member
-                                    if channelMemberIDs.contains(myPeerID) && !memberPeers.contains(myPeerID) {
-                                        memberPeers.append(myPeerID)
-                                    }
-                                    
-                                    return memberPeers
-                                } else {
-                                    // Show all connected peers in main chat
-                                    return viewModel.connectedPeers
-                                }
-                            }()
-                            
-                        // Sort peers: favorites first, then alphabetically by nickname
-                        let sortedPeers = peersToShow.sorted { peer1, peer2 in
-                            let isFav1 = viewModel.isFavorite(peerID: peer1)
-                            let isFav2 = viewModel.isFavorite(peerID: peer2)
-                            
-                            if isFav1 != isFav2 {
-                                return isFav1 // Favorites come first
-                            }
-                            
-                            let name1 = peerNicknames[peer1] ?? "anon\(peer1.prefix(4))"
-                            let name2 = peerNicknames[peer2] ?? "anon\(peer2.prefix(4))"
-                            return name1 < name2
-                        }
-                        
-                        ForEach(sortedPeers, id: \.self) { peerID in
-                            let displayName = peerID == myPeerID ? viewModel.nickname : (peerNicknames[peerID] ?? "anon\(peerID.prefix(4))")
-                            let rssi = peerRSSI[peerID]?.intValue ?? -100
-                            let isFavorite = viewModel.isFavorite(peerID: peerID)
-                            let isMe = peerID == myPeerID
-                            
-                            HStack(spacing: 8) {
-                                // Signal strength indicator or unread message icon
-                                if isMe {
-                                    Image(systemName: "person.fill")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(textColor)
-                                        .accessibilityLabel("You")
-                                } else if viewModel.unreadPrivateMessages.contains(peerID) {
-                                    Image(systemName: "envelope.fill")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(Color.orange)
-                                        .accessibilityLabel("Unread message from \(displayName)")
-                                } else {
-                                    Image(systemName: "radiowaves.left")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(viewModel.getRSSIColor(rssi: rssi, colorScheme: colorScheme))
-                                        .accessibilityLabel("Signal strength: \(rssi > -60 ? "excellent" : rssi > -70 ? "good" : rssi > -80 ? "fair" : "poor")")
-                                }
-                                
-                                // Peer name
-                                if isMe {
-                                    HStack {
-                                        Text(displayName + " (you)")
-                                            .font(.system(size: 14, design: .monospaced))
-                                            .foregroundColor(textColor)
-                                        
-                                        Spacer()
-                                    }
-                                } else {
-                                    Button(action: {
-                                        if peerNicknames[peerID] != nil {
-                                            viewModel.startPrivateChat(with: peerID)
-                                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                                showSidebar = false
-                                                sidebarDragOffset = 0
-                                            }
-                                        }
-                                    }) {
-                                        Text(displayName)
-                                            .font(.system(size: 14, design: .monospaced))
-                                            .foregroundColor(peerNicknames[peerID] != nil ? textColor : secondaryTextColor)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .disabled(peerNicknames[peerID] == nil)
-                                    .onTapGesture(count: 2) {
-                                        // Show fingerprint on double tap
-                                        viewModel.showFingerprint(for: peerID)
-                                    }
-                                    
-                                    // Encryption status icon (after peer name)
-                                    let encryptionStatus = viewModel.getEncryptionStatus(for: peerID)
-                                    Image(systemName: encryptionStatus.icon)
-                                        .font(.system(size: 10))
-                                        .foregroundColor(encryptionStatus == .noiseVerified ? Color.green : 
-                                                       encryptionStatus == .noiseSecured ? textColor :
-                                                       encryptionStatus == .noiseHandshaking ? Color.orange :
-                                                       Color.red)
-                                        .accessibilityLabel("Encryption: \(encryptionStatus == .noiseVerified ? "verified" : encryptionStatus == .noiseSecured ? "secured" : encryptionStatus == .noiseHandshaking ? "establishing" : "none")")
-                                    
-                                    Spacer()
-                                    
-                                    // Favorite star
-                                    Button(action: {
-                                        viewModel.toggleFavorite(peerID: peerID)
-                                    }) {
-                                        Image(systemName: isFavorite ? "star.fill" : "star")
-                                            .font(.system(size: 12))
-                                            .foregroundColor(isFavorite ? Color.yellow : secondaryTextColor)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel(isFavorite ? "Remove \(displayName) from favorites" : "Add \(displayName) to favorites")
-                                }
-                            }
-                            .padding(.horizontal)
-                            .padding(.vertical, 8)
-                        }
-                        }
-                    }
-                }
-                .padding(.vertical, 8)
-            }
-            
-            Spacer()
         }
         .background(backgroundColor)
+        .foregroundColor(textColor)
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 520)
+        #endif
+        // Present image picker from sheet context when IN a sheet (parent-child pattern)
+        #if os(iOS)
+        .fullScreenCover(isPresented: Binding(
+            get: { showImagePicker && (showSidebar || viewModel.selectedPrivateChatPeer != nil) },
+            set: { newValue in
+                if !newValue {
+                    showImagePicker = false
+                }
+            }
+        )) {
+            ImagePickerView(sourceType: imagePickerSourceType) { image in
+                showImagePicker = false
+                if let image = image {
+                    Task {
+                        do {
+                            let processedURL = try ImageUtils.processImage(image)
+                            await MainActor.run {
+                                viewModel.sendImage(from: processedURL)
+                            }
+                        } catch {
+                            SecureLogger.error("Image processing failed: \(error)", category: .session)
+                        }
+                    }
+                }
+            }
+            .environmentObject(viewModel)
+            .ignoresSafeArea()
+        }
+        #endif
+        #if os(macOS)
+        .sheet(isPresented: $showMacImagePicker) {
+            MacImagePickerView { url in
+                showMacImagePicker = false
+                if let url = url {
+                    Task {
+                        do {
+                            let processedURL = try ImageUtils.processImage(at: url)
+                            await MainActor.run {
+                                viewModel.sendImage(from: processedURL)
+                            }
+                        } catch {
+                            SecureLogger.error("Image processing failed: \(error)", category: .session)
+                        }
+                    }
+                }
+            }
+            .environmentObject(viewModel)
+        }
+        #endif
+    }
+    
+    // MARK: - People Sheet Views
+    
+    private var peopleListSheetView: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    Text(peopleSheetTitle)
+                        .font(.bitchatSystem(size: 18, design: .monospaced))
+                        .foregroundColor(textColor)
+                    Spacer()
+                    if case .mesh = locationManager.selectedChannel {
+                        Button(action: { showVerifySheet = true }) {
+                            Image(systemName: "qrcode")
+                                .font(.bitchatSystem(size: 14))
+                        }
+                        .buttonStyle(.plain)
+                        .help(
+                            String(localized: "content.help.verification", comment: "Help text for verification button")
+                        )
+                    }
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
+                            dismiss()
+                            showSidebar = false
+                            showVerifySheet = false
+                            viewModel.endPrivateChat()
+                        }
+                    }) {
+                        Image(systemName: "xmark")
+                            .font(.bitchatSystem(size: 12, weight: .semibold, design: .monospaced))
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
+                }
+                let activeText = String.localizedStringWithFormat(
+                    String(localized: "%@ active", comment: "Count of active users in the people sheet"),
+                    "\(peopleSheetActiveCount)"
+                )
+
+                if let subtitle = peopleSheetSubtitle {
+                    let subtitleColor: Color = {
+                        switch locationManager.selectedChannel {
+                        case .mesh:
+                            return Color.blue
+                        case .location:
+                            return Color.green
+                        }
+                    }()
+                    HStack(spacing: 6) {
+                        Text(subtitle)
+                            .foregroundColor(subtitleColor)
+                        Text(activeText)
+                            .foregroundColor(.secondary)
+                    }
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                } else {
+                    Text(activeText)
+                        .font(.bitchatSystem(size: 12, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+            .background(backgroundColor)
+            
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    if case .location = locationManager.selectedChannel {
+                        GeohashPeopleList(
+                            viewModel: viewModel,
+                            textColor: textColor,
+                            secondaryTextColor: secondaryTextColor,
+                            onTapPerson: {
+                                showSidebar = true
+                            }
+                        )
+                    } else {
+                        MeshPeerList(
+                            viewModel: viewModel,
+                            textColor: textColor,
+                            secondaryTextColor: secondaryTextColor,
+                            onTapPeer: { peerID in
+                                viewModel.startPrivateChat(with: peerID)
+                                showSidebar = true
+                            },
+                            onToggleFavorite: { peerID in
+                                viewModel.toggleFavorite(peerID: peerID)
+                            },
+                            onShowFingerprint: { peerID in
+                                viewModel.showFingerprint(for: peerID)
+                            }
+                        )
+                    }
+                }
+                .padding(.top, 4)
+                .id(viewModel.allPeers.map { "\($0.peerID)-\($0.isConnected)" }.joined())
+            }
         }
     }
     
     // MARK: - View Components
-    
-    private var mainChatView: some View {
+
+    private var privateChatSheetView: some View {
         VStack(spacing: 0) {
-            mainHeaderView
-            Divider()
-            messagesView(for: nil, privatePeer: nil)
+            if let privatePeerID = viewModel.selectedPrivateChatPeer {
+                let headerContext = makePrivateHeaderContext(for: privatePeerID)
+
+                HStack(spacing: 12) {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
+                            viewModel.endPrivateChat()
+                        }
+                    }) {
+                        Image(systemName: "chevron.left")
+                            .font(.bitchatSystem(size: 12))
+                            .foregroundColor(textColor)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        String(localized: "content.accessibility.back_to_main_chat", comment: "Accessibility label for returning to main chat")
+                    )
+
+                    Spacer(minLength: 0)
+
+                    HStack(spacing: 8) {
+                        privateHeaderInfo(context: headerContext, privatePeerID: privatePeerID)
+                        let isFavorite = viewModel.isFavorite(peerID: headerContext.headerPeerID)
+
+                        if !privatePeerID.isGeoDM {
+                            Button(action: {
+                                viewModel.toggleFavorite(peerID: headerContext.headerPeerID)
+                            }) {
+                                Image(systemName: isFavorite ? "star.fill" : "star")
+                                    .font(.bitchatSystem(size: 14))
+                                    .foregroundColor(isFavorite ? Color.yellow : textColor)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(
+                                isFavorite
+                                ? String(localized: "content.accessibility.remove_favorite", comment: "Accessibility label to remove a favorite")
+                                : String(localized: "content.accessibility.add_favorite", comment: "Accessibility label to add a favorite")
+                            )
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    Spacer(minLength: 0)
+
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
+                            viewModel.endPrivateChat()
+                            showSidebar = true
+                        }
+                    }) {
+                        Image(systemName: "xmark")
+                            .font(.bitchatSystem(size: 12, weight: .semibold, design: .monospaced))
+                            .frame(width: 32, height: 32)
+                    }
+                
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
+                }
+                .frame(height: headerHeight)
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                .padding(.bottom, 12)
+                .background(backgroundColor)
+            }
+
+            messagesView(privatePeer: viewModel.selectedPrivateChatPeer, isAtBottom: $isAtBottomPrivate)
+                .background(backgroundColor)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             inputView
         }
         .background(backgroundColor)
         .foregroundColor(textColor)
-        .gesture(
-            DragGesture()
-                .onChanged { value in
-                    if !showSidebar && value.translation.width < 0 {
-                        sidebarDragOffset = max(value.translation.width, -300)
-                    } else if showSidebar && value.translation.width > 0 {
-                        sidebarDragOffset = min(-300 + value.translation.width, 0)
-                    }
-                }
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 25, coordinateSpace: .local)
                 .onEnded { value in
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        if !showSidebar {
-                            if value.translation.width < -100 || (value.translation.width < -50 && value.velocity.width < -500) {
-                                showSidebar = true
-                                sidebarDragOffset = 0
-                            } else {
-                                sidebarDragOffset = 0
-                            }
-                        } else {
-                            if value.translation.width > 100 || (value.translation.width > 50 && value.velocity.width > 500) {
-                                showSidebar = false
-                                sidebarDragOffset = 0
-                            } else {
-                                sidebarDragOffset = 0
-                            }
-                        }
+                    let horizontal = value.translation.width
+                    let vertical = abs(value.translation.height)
+                    guard horizontal > 80, vertical < 60 else { return }
+                    withAnimation(.easeInOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
+                        showSidebar = true
+                        viewModel.endPrivateChat()
                     }
                 }
         )
     }
-    
-    private var privateChatView: some View {
-        HStack(spacing: 0) {
-            // Vertical separator bar
-            Rectangle()
-                .fill(Color.gray.opacity(0.3))
-                .frame(width: 1)
-            
-            VStack(spacing: 0) {
-                privateHeaderView
-                Divider()
-                messagesView(for: nil, privatePeer: viewModel.selectedPrivateChatPeer)
-                Divider()
-                inputView
+
+    private func privateHeaderInfo(context: PrivateHeaderContext, privatePeerID: PeerID) -> some View {
+        Button(action: {
+            viewModel.showFingerprint(for: context.headerPeerID)
+        }) {
+            HStack(spacing: 6) {
+                if let connectionState = context.peer?.connectionState {
+                    switch connectionState {
+                    case .bluetoothConnected:
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.bitchatSystem(size: 14))
+                            .foregroundColor(textColor)
+                            .accessibilityLabel(String(localized: "content.accessibility.connected_mesh", comment: "Accessibility label for mesh-connected peer indicator"))
+                    case .meshReachable:
+                        Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                            .font(.bitchatSystem(size: 14))
+                            .foregroundColor(textColor)
+                            .accessibilityLabel(String(localized: "content.accessibility.reachable_mesh", comment: "Accessibility label for mesh-reachable peer indicator"))
+                    case .nostrAvailable:
+                        Image(systemName: "globe")
+                            .font(.bitchatSystem(size: 14))
+                            .foregroundColor(.purple)
+                            .accessibilityLabel(String(localized: "content.accessibility.available_nostr", comment: "Accessibility label for Nostr-available peer indicator"))
+                    case .offline:
+                        EmptyView()
+                    }
+                } else if viewModel.meshService.isPeerReachable(context.headerPeerID) {
+                    Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                        .font(.bitchatSystem(size: 14))
+                        .foregroundColor(textColor)
+                        .accessibilityLabel(String(localized: "content.accessibility.reachable_mesh", comment: "Accessibility label for mesh-reachable peer indicator"))
+                } else if context.isNostrAvailable {
+                    Image(systemName: "globe")
+                        .font(.bitchatSystem(size: 14))
+                        .foregroundColor(.purple)
+                        .accessibilityLabel(String(localized: "content.accessibility.available_nostr", comment: "Accessibility label for Nostr-available peer indicator"))
+                } else if viewModel.meshService.isPeerConnected(context.headerPeerID) || viewModel.connectedPeers.contains(context.headerPeerID) {
+                    Image(systemName: "dot.radiowaves.left.and.right")
+                        .font(.bitchatSystem(size: 14))
+                        .foregroundColor(textColor)
+                        .accessibilityLabel(String(localized: "content.accessibility.connected_mesh", comment: "Accessibility label for mesh-connected peer indicator"))
+                }
+
+                Text(context.displayName)
+                    .font(.bitchatSystem(size: 16, weight: .medium, design: .monospaced))
+                    .foregroundColor(textColor)
+
+                if !privatePeerID.isGeoDM {
+                    let statusPeerID = viewModel.getShortIDForNoiseKey(privatePeerID)
+                    let encryptionStatus = viewModel.getEncryptionStatus(for: statusPeerID)
+                    if let icon = encryptionStatus.icon {
+                        Image(systemName: icon)
+                            .font(.bitchatSystem(size: 14))
+                            .foregroundColor(encryptionStatus == .noiseVerified ? textColor :
+                                             encryptionStatus == .noiseSecured ? textColor :
+                                             Color.red)
+                            .accessibilityLabel(
+                                String(
+                                    format: String(localized: "content.accessibility.encryption_status", comment: "Accessibility label announcing encryption status"),
+                                    locale: .current,
+                                    encryptionStatus.accessibilityDescription
+                                )
+                            )
+                    }
+                }
             }
-            .background(backgroundColor)
-            .foregroundColor(textColor)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            String(
+                format: String(localized: "content.accessibility.private_chat_header", comment: "Accessibility label describing the private chat header"),
+                locale: .current,
+                context.displayName
+            )
+        )
+        .accessibilityHint(
+            String(localized: "content.accessibility.view_fingerprint_hint", comment: "Accessibility hint for viewing encryption fingerprint")
+        )
+        .frame(height: headerHeight)
+    }
+
+    private func makePrivateHeaderContext(for privatePeerID: PeerID) -> PrivateHeaderContext {
+        let headerPeerID = viewModel.getShortIDForNoiseKey(privatePeerID)
+        let peer = viewModel.getPeer(byID: headerPeerID)
+
+        let displayName: String = {
+            if privatePeerID.isGeoDM, case .location(let ch) = locationManager.selectedChannel {
+                let disp = viewModel.geohashDisplayName(for: privatePeerID)
+                return "#\(ch.geohash)/@\(disp)"
+            }
+            if let name = peer?.displayName { return name }
+            if let name = viewModel.meshService.peerNickname(peerID: headerPeerID) { return name }
+            if let fav = FavoritesPersistenceService.shared.getFavoriteStatus(for: Data(hexString: headerPeerID.id) ?? Data()),
+               !fav.peerNickname.isEmpty { return fav.peerNickname }
+            if headerPeerID.id.count == 16 {
+                let candidates = viewModel.identityManager.getCryptoIdentitiesByPeerIDPrefix(headerPeerID)
+                if let id = candidates.first,
+                   let social = viewModel.identityManager.getSocialIdentity(for: id.fingerprint) {
+                    if let pet = social.localPetname, !pet.isEmpty { return pet }
+                    if !social.claimedNickname.isEmpty { return social.claimedNickname }
+                }
+            } else if let keyData = headerPeerID.noiseKey {
+                let fp = keyData.sha256Fingerprint()
+                if let social = viewModel.identityManager.getSocialIdentity(for: fp) {
+                    if let pet = social.localPetname, !pet.isEmpty { return pet }
+                    if !social.claimedNickname.isEmpty { return social.claimedNickname }
+                }
+            }
+            return String(localized: "common.unknown", comment: "Fallback label for unknown peer")
+        }()
+
+        let isNostrAvailable: Bool = {
+            guard let connectionState = peer?.connectionState else {
+                if let noiseKey = Data(hexString: headerPeerID.id),
+                   let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey),
+                   favoriteStatus.isMutual {
+                    return true
+                }
+                return false
+            }
+            return connectionState == .nostrAvailable
+        }()
+
+        return PrivateHeaderContext(
+            headerPeerID: headerPeerID,
+            peer: peer,
+            displayName: displayName,
+            isNostrAvailable: isNostrAvailable
+        )
+    }
+
+    // Compute channel-aware people count and color for toolbar (cross-platform)
+    private func channelPeopleCountAndColor() -> (Int, Color) {
+        switch locationManager.selectedChannel {
+        case .location:
+            let n = viewModel.geohashPeople.count
+            let standardGreen = (colorScheme == .dark) ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+            return (n, n > 0 ? standardGreen : Color.secondary)
+        case .mesh:
+            let counts = viewModel.allPeers.reduce(into: (others: 0, mesh: 0)) { counts, peer in
+                guard peer.peerID != viewModel.meshService.myPeerID else { return }
+                if peer.isConnected { counts.mesh += 1; counts.others += 1 }
+                else if peer.isReachable { counts.others += 1 }
+            }
+            let meshBlue = Color(hue: 0.60, saturation: 0.85, brightness: 0.82)
+            let color: Color = counts.mesh > 0 ? meshBlue : Color.secondary
+            return (counts.others, color)
         }
     }
-    
-    private var channelView: some View {
-        HStack(spacing: 0) {
-            // Vertical separator bar
-            Rectangle()
-                .fill(Color.gray.opacity(0.3))
-                .frame(width: 1)
-            
-            VStack(spacing: 0) {
-                channelHeaderView
-                Divider()
-                messagesView(for: viewModel.currentChannel, privatePeer: nil)
-                Divider()
-                inputView
-            }
-            .background(backgroundColor)
-            .foregroundColor(textColor)
-        }
-    }
+
     
     private var mainHeaderView: some View {
-        HStack(spacing: 4) {
-            Text("bitchat*")
-                .font(.system(size: 18, weight: .medium, design: .monospaced))
+        HStack(spacing: 0) {
+            Text(verbatim: "bitchat/")
+                .font(.bitchatSystem(size: 18, weight: .medium, design: .monospaced))
                 .foregroundColor(textColor)
                 .onTapGesture(count: 3) {
                     // PANIC: Triple-tap to clear all data
@@ -973,440 +1214,924 @@ struct ContentView: View {
                 }
             
             HStack(spacing: 0) {
-                Text("@")
-                    .font(.system(size: 14, design: .monospaced))
+                Text(verbatim: "@")
+                    .font(.bitchatSystem(size: 14, design: .monospaced))
                     .foregroundColor(secondaryTextColor)
                 
-                TextField("nickname", text: $viewModel.nickname)
+                TextField("content.input.nickname_placeholder", text: $viewModel.nickname)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 14, design: .monospaced))
-                    .frame(maxWidth: 100)
+                    .font(.bitchatSystem(size: 14, design: .monospaced))
+                    .frame(maxWidth: 80)
                     .foregroundColor(textColor)
-                    .onChange(of: viewModel.nickname) { _ in
-                        viewModel.saveNickname()
+                    .focused($isNicknameFieldFocused)
+                    .autocorrectionDisabled(true)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .onChange(of: isNicknameFieldFocused) { isFocused in
+                        if !isFocused {
+                            // Only validate when losing focus
+                            viewModel.validateAndSaveNickname()
+                        }
                     }
                     .onSubmit {
-                        viewModel.saveNickname()
+                        viewModel.validateAndSaveNickname()
                     }
             }
             
             Spacer()
             
-            // People counter with unread indicator
-            HStack(spacing: 4) {
-                // Check for any unread channel messages
-                let hasUnreadChannelMessages = viewModel.unreadChannelMessages.values.contains { $0 > 0 }
-                
-                if hasUnreadChannelMessages {
-                    Image(systemName: "number")
-                        .font(.system(size: 12))
-                        .foregroundColor(Color.blue)
-                        .accessibilityLabel("Unread channel messages")
+            // Channel badge + dynamic spacing + people counter
+            // Precompute header count and color outside the ViewBuilder expressions
+            let cc = channelPeopleCountAndColor()
+            let headerCountColor: Color = cc.1
+            let headerOtherPeersCount: Int = {
+                if case .location = locationManager.selectedChannel {
+                    return viewModel.visibleGeohashPeople().count
                 }
+                return cc.0
+            }()
+
+            HStack(spacing: 10) {
+                // Unread icon immediately to the left of the channel badge (independent from channel button)
                 
-                if !viewModel.unreadPrivateMessages.isEmpty {
-                    Image(systemName: "envelope.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(Color.orange)
-                        .accessibilityLabel("Unread private messages")
+                // Unread indicator (now shown on iOS and macOS)
+                if viewModel.hasAnyUnreadMessages {
+                    Button(action: { viewModel.openMostRelevantPrivateChat() }) {
+                        Image(systemName: "envelope.fill")
+                            .font(.bitchatSystem(size: 12))
+                            .foregroundColor(Color.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        String(localized: "content.accessibility.open_unread_private_chat", comment: "Accessibility label for the unread private chat button")
+                    )
                 }
-                
-                let otherPeersCount = viewModel.connectedPeers.filter { $0 != viewModel.meshService.myPeerID }.count
-                let channelCount = viewModel.joinedChannels.count
-                
+                // Notes icon (mesh only and when location is authorized), to the left of #mesh
+                if case .mesh = locationManager.selectedChannel, locationManager.permissionState == .authorized {
+                    Button(action: {
+                        // Kick a one-shot refresh and show the sheet immediately.
+                        LocationChannelManager.shared.enableLocationChannels()
+                        LocationChannelManager.shared.refreshChannels()
+                        // If we already have a block geohash, pass it; otherwise wait in the sheet.
+                        notesGeohash = LocationChannelManager.shared.availableChannels.first(where: { $0.level == .building })?.geohash
+                        showLocationNotes = true
+                    }) {
+                        HStack(alignment: .center, spacing: 4) {
+                            Image(systemName: "note.text")
+                                .font(.bitchatSystem(size: 12))
+                                .foregroundColor(Color.orange.opacity(0.8))
+                                .padding(.top, 1)
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        String(localized: "content.accessibility.location_notes", comment: "Accessibility label for location notes button")
+                    )
+                }
+
+                // Bookmark toggle (geochats): to the left of #geohash
+                if case .location(let ch) = locationManager.selectedChannel {
+                    Button(action: { bookmarks.toggle(ch.geohash) }) {
+                        Image(systemName: bookmarks.isBookmarked(ch.geohash) ? "bookmark.fill" : "bookmark")
+                            .font(.bitchatSystem(size: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        String(
+                            format: String(localized: "content.accessibility.toggle_bookmark", comment: "Accessibility label for toggling a geohash bookmark"),
+                            locale: .current,
+                            ch.geohash
+                        )
+                    )
+                }
+
+                // Location channels button '#'
+                Button(action: { showLocationChannelsSheet = true }) {
+                    let badgeText: String = {
+                        switch locationManager.selectedChannel {
+                        case .mesh: return "#mesh"
+                        case .location(let ch): return "#\(ch.geohash)"
+                        }
+                    }()
+                    let badgeColor: Color = {
+                        switch locationManager.selectedChannel {
+                        case .mesh:
+                            return Color(hue: 0.60, saturation: 0.85, brightness: 0.82)
+                        case .location:
+                            return (colorScheme == .dark) ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+                        }
+                    }()
+                    Text(badgeText)
+                        .font(.bitchatSystem(size: 14, design: .monospaced))
+                        .foregroundColor(badgeColor)
+                        .lineLimit(headerLineLimit)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(2)
+                        .accessibilityLabel(
+                            String(localized: "content.accessibility.location_channels", comment: "Accessibility label for the location channels button")
+                        )
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 4)
+                .padding(.trailing, 2)
+
                 HStack(spacing: 4) {
                     // People icon with count
                     Image(systemName: "person.2.fill")
-                        .font(.system(size: 11))
-                        .accessibilityLabel("\(otherPeersCount) connected \(otherPeersCount == 1 ? "person" : "people")")
-                    Text("\(otherPeersCount)")
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(.system(size: headerPeerIconSize, weight: .regular))
+                        .accessibilityLabel(
+                            String(
+                                format: String(localized: "content.accessibility.people_count", comment: "Accessibility label announcing number of people in header"),
+                                locale: .current,
+                                headerOtherPeersCount
+                            )
+                        )
+                    Text("\(headerOtherPeersCount)")
+                        .font(.system(size: headerPeerCountFontSize, weight: .regular, design: .monospaced))
                         .accessibilityHidden(true)
-                    
-                    // Channels icon with count (only if there are channels)
-                    if channelCount > 0 {
-                        Text("·")
-                            .font(.system(size: 12, design: .monospaced))
-                        Image(systemName: "square.split.2x2")
-                            .font(.system(size: 11))
-                            .accessibilityLabel("\(channelCount) active \(channelCount == 1 ? "channel" : "channels")")
-                        Text("\(channelCount)")
-                            .font(.system(size: 12, design: .monospaced))
-                            .accessibilityHidden(true)
-                    }
                 }
-                .foregroundColor(viewModel.isConnected ? textColor : Color.red)
+                .foregroundColor(headerCountColor)
+                .padding(.leading, 2)
+                .lineLimit(headerLineLimit)
+                .fixedSize(horizontal: true, vertical: false)
+
+                // QR moved to the PEOPLE header in the sidebar when on mesh channel
             }
+            .layoutPriority(3)
             .onTapGesture {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                withAnimation(.easeInOut(duration: TransportConfig.uiAnimationMediumSeconds)) {
                     showSidebar.toggle()
-                    sidebarDragOffset = 0
+                }
+            }
+            .sheet(isPresented: $showVerifySheet) {
+                VerificationSheetView(isPresented: $showVerifySheet)
+                    .environmentObject(viewModel)
+            }
+        }
+        .frame(height: headerHeight)
+        .padding(.horizontal, 12)
+        .sheet(isPresented: $showLocationChannelsSheet) {
+            LocationChannelsSheet(isPresented: $showLocationChannelsSheet)
+                .environmentObject(viewModel)
+                .onAppear { viewModel.isLocationChannelsSheetPresented = true }
+                .onDisappear { viewModel.isLocationChannelsSheetPresented = false }
+        }
+        .sheet(isPresented: $showLocationNotes, onDismiss: {
+            notesGeohash = nil
+        }) {
+            Group {
+                if let gh = notesGeohash ?? LocationChannelManager.shared.availableChannels.first(where: { $0.level == .building })?.geohash {
+                    LocationNotesView(geohash: gh)
+                        .environmentObject(viewModel)
+                } else {
+                    VStack(spacing: 12) {
+                        HStack {
+                            Text("content.notes.title")
+                                .font(.bitchatSystem(size: 16, weight: .bold, design: .monospaced))
+                            Spacer()
+                            Button(action: { showLocationNotes = false }) {
+                                Image(systemName: "xmark")
+                                    .font(.bitchatSystem(size: 13, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(textColor)
+                                    .frame(width: 32, height: 32)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(String(localized: "common.close", comment: "Accessibility label for close buttons"))
+                        }
+                        .frame(height: headerHeight)
+                        .padding(.horizontal, 12)
+                        .background(backgroundColor.opacity(0.95))
+                        Text("content.notes.location_unavailable")
+                            .font(.bitchatSystem(size: 14, design: .monospaced))
+                            .foregroundColor(secondaryTextColor)
+                        Button("content.location.enable") {
+                            LocationChannelManager.shared.enableLocationChannels()
+                            LocationChannelManager.shared.refreshChannels()
+                        }
+                        .buttonStyle(.bordered)
+                        Spacer()
+                    }
+                    .background(backgroundColor)
+                    .foregroundColor(textColor)
+                    // per-sheet global onChange added below
+                }
+            }
+            .onAppear {
+                // Ensure we are authorized and start live location updates (distance-filtered)
+                LocationChannelManager.shared.enableLocationChannels()
+                LocationChannelManager.shared.beginLiveRefresh()
+            }
+            .onDisappear {
+                LocationChannelManager.shared.endLiveRefresh()
+            }
+            .onChange(of: locationManager.availableChannels) { channels in
+                if let current = channels.first(where: { $0.level == .building })?.geohash,
+                    notesGeohash != current {
+                    notesGeohash = current
+                    #if os(iOS)
+                    // Light taptic when geohash changes while the sheet is open
+                    let generator = UIImpactFeedbackGenerator(style: .light)
+                    generator.prepare()
+                    generator.impactOccurred()
+                    #endif
                 }
             }
         }
-        .frame(height: 44)
-        .padding(.horizontal, 12)
+        .onAppear {
+            if case .mesh = locationManager.selectedChannel,
+               locationManager.permissionState == .authorized,
+               LocationChannelManager.shared.availableChannels.isEmpty {
+                LocationChannelManager.shared.refreshChannels()
+            }
+        }
+        .onChange(of: locationManager.selectedChannel) { _ in
+            if case .mesh = locationManager.selectedChannel,
+               locationManager.permissionState == .authorized,
+               LocationChannelManager.shared.availableChannels.isEmpty {
+                LocationChannelManager.shared.refreshChannels()
+            }
+        }
+        .onChange(of: locationManager.permissionState) { _ in
+            if case .mesh = locationManager.selectedChannel,
+               locationManager.permissionState == .authorized,
+               LocationChannelManager.shared.availableChannels.isEmpty {
+                LocationChannelManager.shared.refreshChannels()
+            }
+        }
+        .alert("content.alert.screenshot.title", isPresented: $viewModel.showScreenshotPrivacyWarning) {
+            Button("common.ok", role: .cancel) {}
+        } message: {
+            Text("content.alert.screenshot.message")
+        }
         .background(backgroundColor.opacity(0.95))
     }
-    
-    private var privateHeaderView: some View {
-        Group {
-            if let privatePeerID = viewModel.selectedPrivateChatPeer,
-               let privatePeerNick = viewModel.meshService.getPeerNicknames()[privatePeerID] {
-                HStack {
-                    Button(action: {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                            showPrivateChat = false
-                            viewModel.endPrivateChat()
-                        }
-                    }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 12))
-                            Text("back")
-                                .font(.system(size: 14, design: .monospaced))
-                        }
-                        .foregroundColor(textColor)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Back to main chat")
-                    
-                    Spacer()
-                    
-                    Button(action: {
-                        viewModel.showFingerprint(for: privatePeerID)
-                    }) {
-                        HStack(spacing: 6) {
-                            Text("\(privatePeerNick)")
-                                .font(.system(size: 16, weight: .medium, design: .monospaced))
-                                .foregroundColor(Color.orange)
-                            // Dynamic encryption status icon
-                            let encryptionStatus = viewModel.getEncryptionStatus(for: privatePeerID)
-                            Image(systemName: encryptionStatus.icon)
-                                .font(.system(size: 14))
-                                .foregroundColor(encryptionStatus == .noiseVerified ? Color.green : 
-                                               encryptionStatus == .noiseSecured ? Color.orange :
-                                               Color.red)
-                                .accessibilityLabel("Encryption status: \(encryptionStatus == .noiseVerified ? "verified" : encryptionStatus == .noiseSecured ? "secured" : "not encrypted")")
-                        }
-                        .frame(maxWidth: .infinity)
-                        .accessibilityLabel("Private chat with \(privatePeerNick)")
-                        .accessibilityHint("Tap to view encryption fingerprint")
-                    }
-                    .buttonStyle(.plain)
-                    
-                    Spacer()
-                    
-                    // Favorite button
-                    Button(action: {
-                        viewModel.toggleFavorite(peerID: privatePeerID)
-                    }) {
-                        Image(systemName: viewModel.isFavorite(peerID: privatePeerID) ? "star.fill" : "star")
-                            .font(.system(size: 16))
-                            .foregroundColor(viewModel.isFavorite(peerID: privatePeerID) ? Color.yellow : textColor)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(viewModel.isFavorite(peerID: privatePeerID) ? "Remove from favorites" : "Add to favorites")
-                    .accessibilityHint("Double tap to toggle favorite status")
-                }
-                .frame(height: 44)
-                .padding(.horizontal, 12)
-                .background(backgroundColor.opacity(0.95))
-            } else {
-                EmptyView()
-            }
-        }
-    }
-    
-    private var channelHeaderView: some View {
-        Group {
-            if let currentChannel = viewModel.currentChannel {
-                HStack {
-                Button(action: {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        showChannel = false
-                        viewModel.switchToChannel(nil)
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 12))
-                        Text("back")
-                            .font(.system(size: 14, design: .monospaced))
-                    }
-                    .foregroundColor(textColor)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Back to main chat")
-                
-                Spacer()
-                
-                Button(action: {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        showSidebar.toggle()
-                        sidebarDragOffset = 0
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        if viewModel.passwordProtectedChannels.contains(currentChannel) {
-                            Image(systemName: "lock.fill")
-                                .font(.system(size: 14))
-                                .foregroundColor(Color.orange)
-                                .accessibilityLabel("Password protected channel")
-                        }
-                        
-                        Text(currentChannel)
-                            .font(.system(size: 16, weight: .medium, design: .monospaced))
-                            .foregroundColor(viewModel.passwordProtectedChannels.contains(currentChannel) ? Color.orange : Color.blue)
-                        
-                        // Verification status indicator after channel name
-                        if viewModel.passwordProtectedChannels.contains(currentChannel),
-                           let status = viewModel.channelVerificationStatus[currentChannel] {
-                            switch status {
-                            case .verifying:
-                                ProgressView()
-                                    .scaleEffect(0.5)
-                                    .frame(width: 12, height: 12)
-                            case .verified:
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(Color.green)
-                            case .failed:
-                                Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(Color.red)
-                            case .unverified:
-                                Image(systemName: "questionmark.circle")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(Color.gray)
-                                    .help("Password verification pending")
-                            }
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity)
-                
-                Spacer()
-                
-                HStack(spacing: 8) {
-                    // Password button for channel creator only
-                    if viewModel.isChannelOwner(currentChannel) {
-                        Button(action: {
-                            // Toggle password protection
-                            if viewModel.passwordProtectedChannels.contains(currentChannel) {
-                                viewModel.removeChannelPassword(for: currentChannel)
-                            } else {
-                                // Show password input
-                                showPasswordInput = true
-                                passwordInputChannel = currentChannel
-                            }
-                        }) {
-                            Image(systemName: viewModel.passwordProtectedChannels.contains(currentChannel) ? "lock.fill" : "lock")
-                                .font(.system(size: 16))
-                                .foregroundColor(viewModel.passwordProtectedChannels.contains(currentChannel) ? Color.yellow : textColor)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(viewModel.passwordProtectedChannels.contains(currentChannel) ? "Remove channel password" : "Set channel password")
-                    }
-                    
-                    // Leave channel button
-                    Button(action: {
-                        showLeaveChannelAlert = true
-                    }) {
-                        Image(systemName: "xmark.circle")
-                            .font(.system(size: 16))
-                            .foregroundColor(Color.red.opacity(0.8))
-                    }
-                    .buttonStyle(.plain)
-                    .alert("leave channel?", isPresented: $showLeaveChannelAlert) {
-                        Button("cancel", role: .cancel) { }
-                        Button("leave", role: .destructive) {
-                            viewModel.leaveChannel(currentChannel)
-                        }
-                    } message: {
-                        Text("sure you want to leave \(currentChannel)?")
-                    }
-                }
-            }
-            .frame(height: 44)
-            .padding(.horizontal, 12)
-            .background(backgroundColor.opacity(0.95))
-            } else {
-                EmptyView()
-            }
+
+}
+
+// MARK: - Helper Views
+
+// Rounded payment chip button
+//
+
+private enum MessageMedia {
+    case voice(URL)
+    case image(URL)
+
+    var url: URL {
+        switch self {
+        case .voice(let url), .image(let url):
+            return url
         }
     }
 }
 
-// Helper view for rendering message content with clickable hashtags
-struct MessageContentView: View {
-    let message: BitchatMessage
-    let viewModel: ChatViewModel
-    let colorScheme: ColorScheme
-    let isMentioned: Bool
-    
-    var body: some View {
-        let content = message.content
-        let hashtagPattern = "#([a-zA-Z0-9_]+)"
-        let mentionPattern = "@([a-zA-Z0-9_]+)"
-        
-        let hashtagRegex = try? NSRegularExpression(pattern: hashtagPattern, options: [])
-        let mentionRegex = try? NSRegularExpression(pattern: mentionPattern, options: [])
-        
-        let hashtagMatches = hashtagRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        let mentionMatches = mentionRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        
-        // Combine all matches and sort by location
-        var allMatches: [(range: NSRange, type: String)] = []
-        for match in hashtagMatches {
-            allMatches.append((match.range(at: 0), "hashtag"))
+private extension ContentView {
+    func mediaAttachment(for message: BitchatMessage) -> MessageMedia? {
+        guard let baseDirectory = applicationFilesDirectory() else { return nil }
+
+        // Extract filename from message content
+        func url(from prefix: String, subdirectory: String) -> URL? {
+            guard message.content.hasPrefix(prefix) else { return nil }
+            let filename = String(message.content.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !filename.isEmpty else { return nil }
+
+            // Construct URL directly without fileExists check (avoids blocking disk I/O in view body)
+            // Files are checked during playback/display, so missing files fail gracefully
+            let directory = baseDirectory.appendingPathComponent(subdirectory, isDirectory: true)
+            return directory.appendingPathComponent(filename)
         }
-        for match in mentionMatches {
-            allMatches.append((match.range(at: 0), "mention"))
+
+        // Try outgoing first (most common for sent media), fall back to incoming
+        if message.content.hasPrefix("[voice] ") {
+            let filename = String(message.content.dropFirst("[voice] ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !filename.isEmpty else { return nil }
+            // Check outgoing first for sent messages, incoming for received
+            let subdir = message.sender == viewModel.nickname ? "voicenotes/outgoing" : "voicenotes/incoming"
+            let url = baseDirectory.appendingPathComponent(subdir, isDirectory: true).appendingPathComponent(filename)
+            return .voice(url)
         }
-        allMatches.sort { $0.range.location < $1.range.location }
-        
-        // Build the text as a concatenated Text view for natural wrapping
-        let segments = buildTextSegments()
-        var result = Text("")
-        
-        for segment in segments {
-            if segment.type == "hashtag" {
-                // Note: We can't have clickable links in concatenated Text, so hashtags won't be clickable
-                result = result + Text(segment.text)
-                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Color.blue)
-                    .underline()
-            } else if segment.type == "mention" {
-                result = result + Text(segment.text)
-                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Color.orange)
-            } else {
-                result = result + Text(segment.text)
-                    .font(.system(size: 14, design: .monospaced))
-                    .fontWeight(isMentioned ? .bold : .regular)
+        if message.content.hasPrefix("[image] ") {
+            let filename = String(message.content.dropFirst("[image] ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !filename.isEmpty else { return nil }
+            let subdir = message.sender == viewModel.nickname ? "images/outgoing" : "images/incoming"
+            let url = baseDirectory.appendingPathComponent(subdir, isDirectory: true).appendingPathComponent(filename)
+            return .image(url)
+        }
+        return nil
+    }
+
+    func mediaSendState(for message: BitchatMessage, mediaURL: URL) -> (isSending: Bool, progress: Double?, canCancel: Bool) {
+        var isSending = false
+        var progress: Double?
+        if let status = message.deliveryStatus {
+            switch status {
+            case .sending:
+                isSending = true
+                progress = 0
+            case .partiallyDelivered(let reached, let total):
+                if total > 0 {
+                    isSending = true
+                    progress = Double(reached) / Double(total)
+                }
+            case .sent, .read, .delivered, .failed:
+                break
             }
         }
-        
-        return result
-            .textSelection(.enabled)
+        let isOutgoing = mediaURL.path.contains("/outgoing/")
+        let canCancel = isSending && isOutgoing
+        let clamped = progress.map { max(0, min(1, $0)) }
+        return (isSending, isSending ? clamped : nil, canCancel)
     }
-    
-    private func buildTextSegments() -> [(text: String, type: String)] {
-        var segments: [(text: String, type: String)] = []
-        let content = message.content
-        var lastEnd = content.startIndex
-        
-        let hashtagPattern = "#([a-zA-Z0-9_]+)"
-        let mentionPattern = "@([a-zA-Z0-9_]+)"
-        
-        let hashtagRegex = try? NSRegularExpression(pattern: hashtagPattern, options: [])
-        let mentionRegex = try? NSRegularExpression(pattern: mentionPattern, options: [])
-        
-        let hashtagMatches = hashtagRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        let mentionMatches = mentionRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        
-        // Combine all matches and sort by location
-        var allMatches: [(range: NSRange, type: String)] = []
-        for match in hashtagMatches {
-            allMatches.append((match.range(at: 0), "hashtag"))
+
+    @ViewBuilder
+    private func messageRow(for message: BitchatMessage) -> some View {
+        if message.sender == "system" {
+            systemMessageRow(message)
+        } else if let media = mediaAttachment(for: message) {
+            mediaMessageRow(message: message, media: media)
+        } else {
+            TextMessageView(message: message, expandedMessageIDs: $expandedMessageIDs)
         }
-        for match in mentionMatches {
-            allMatches.append((match.range(at: 0), "mention"))
+    }
+
+    @ViewBuilder
+    private func systemMessageRow(_ message: BitchatMessage) -> some View {
+        Text(viewModel.formatMessageAsText(message, colorScheme: colorScheme))
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func mediaMessageRow(message: BitchatMessage, media: MessageMedia) -> some View {
+        let mediaURL = media.url
+        let state = mediaSendState(for: message, mediaURL: mediaURL)
+        let isOutgoing = mediaURL.path.contains("/outgoing/")
+        let isAuthoredByUs = isOutgoing || (message.senderPeerID == viewModel.meshService.myPeerID)
+        let shouldBlurImage = !isAuthoredByUs
+        let cancelAction: (() -> Void)? = state.canCancel ? { viewModel.cancelMediaSend(messageID: message.id) } : nil
+
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .center, spacing: 4) {
+                Text(viewModel.formatMessageHeader(message, colorScheme: colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if message.isPrivate && message.sender == viewModel.nickname,
+                   let status = message.deliveryStatus {
+                    DeliveryStatusView(status: status)
+                        .padding(.leading, 4)
+                }
+            }
+
+            Group {
+                switch media {
+                case .voice(let url):
+                    VoiceNoteView(
+                        url: url,
+                        isSending: state.isSending,
+                        sendProgress: state.progress,
+                        onCancel: cancelAction
+                    )
+                case .image(let url):
+                    BlockRevealImageView(
+                        url: url,
+                        revealProgress: state.progress,
+                        isSending: state.isSending,
+                        onCancel: cancelAction,
+                        initiallyBlurred: shouldBlurImage,
+                        onOpen: {
+                            if !state.isSending {
+                                imagePreviewURL = url
+                            }
+                        },
+                        onDelete: shouldBlurImage ? {
+                            viewModel.deleteMediaMessage(messageID: message.id)
+                        } : nil
+                    )
+                    .frame(maxWidth: 280)
+                }
+            }
         }
-        allMatches.sort { $0.range.location < $1.range.location }
-        
-        for (matchRange, matchType) in allMatches {
-            if let range = Range(matchRange, in: content) {
-                // Add text before the match
-                if lastEnd < range.lowerBound {
-                    let beforeText = String(content[lastEnd..<range.lowerBound])
-                    if !beforeText.isEmpty {
-                        segments.append((beforeText, "text"))
+        .padding(.vertical, 4)
+    }
+
+    private func expandWindow(ifNeededFor message: BitchatMessage,
+                              allMessages: [BitchatMessage],
+                              privatePeer: PeerID?,
+                              proxy: ScrollViewProxy) {
+        let step = TransportConfig.uiWindowStepCount
+        let contextKey: String = {
+            if let peer = privatePeer { return "dm:\(peer)" }
+            switch locationManager.selectedChannel {
+            case .mesh: return "mesh"
+            case .location(let ch): return "geo:\(ch.geohash)"
+            }
+        }()
+        let preserveID = "\(contextKey)|\(message.id)"
+
+        if let peer = privatePeer {
+            let current = windowCountPrivate[peer] ?? TransportConfig.uiWindowInitialCountPrivate
+            let newCount = min(allMessages.count, current + step)
+            guard newCount != current else { return }
+            windowCountPrivate[peer] = newCount
+            DispatchQueue.main.async {
+                proxy.scrollTo(preserveID, anchor: .top)
+            }
+        } else {
+            let current = windowCountPublic
+            let newCount = min(allMessages.count, current + step)
+            guard newCount != current else { return }
+            windowCountPublic = newCount
+            DispatchQueue.main.async {
+                proxy.scrollTo(preserveID, anchor: .top)
+            }
+        }
+    }
+
+    var recordingIndicator: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "waveform.circle.fill")
+                .foregroundColor(.red)
+                .font(.bitchatSystem(size: 20))
+            Text("recording \(formattedRecordingDuration())", comment: "Voice note recording duration indicator")
+                .font(.bitchatSystem(size: 13, design: .monospaced))
+                .foregroundColor(.red)
+            Spacer()
+            Button(action: cancelVoiceRecording) {
+                Label("Cancel", systemImage: "xmark.circle")
+                    .labelStyle(.iconOnly)
+                    .font(.bitchatSystem(size: 18))
+                    .foregroundColor(.red)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.red.opacity(0.15))
+        )
+    }
+
+    private var trimmedMessageText: String {
+        messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var shouldShowMediaControls: Bool {
+        if let peer = viewModel.selectedPrivateChatPeer, !(peer.isGeoDM || peer.isGeoChat) {
+            return true
+        }
+        switch locationManager.selectedChannel {
+        case .mesh:
+            return true
+        case .location:
+            return false
+        }
+    }
+
+    private var shouldShowVoiceControl: Bool {
+        if let peer = viewModel.selectedPrivateChatPeer, !(peer.isGeoDM || peer.isGeoChat) {
+            return true
+        }
+        switch locationManager.selectedChannel {
+        case .mesh:
+            return true
+        case .location:
+            return false
+        }
+    }
+
+    private var composerAccentColor: Color {
+        viewModel.selectedPrivateChatPeer != nil ? Color.orange : textColor
+    }
+
+    var attachmentButton: some View {
+        #if os(iOS)
+        Image(systemName: "camera.circle.fill")
+            .font(.bitchatSystem(size: 24))
+            .foregroundColor(composerAccentColor)
+            .frame(width: 36, height: 36)
+            .contentShape(Circle())
+            .onTapGesture {
+                // Tap = Photo Library
+                imagePickerSourceType = .photoLibrary
+                showImagePicker = true
+            }
+            .onLongPressGesture(minimumDuration: 0.3) {
+                // Long press = Camera
+                imagePickerSourceType = .camera
+                showImagePicker = true
+            }
+            .accessibilityLabel("Tap for library, long press for camera")
+        #else
+        Button(action: { showMacImagePicker = true }) {
+            Image(systemName: "photo.circle.fill")
+                .font(.bitchatSystem(size: 24))
+                .foregroundColor(composerAccentColor)
+                .frame(width: 36, height: 36)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Choose photo")
+        #endif
+    }
+
+    @ViewBuilder
+    var sendOrMicButton: some View {
+        let hasText = !trimmedMessageText.isEmpty
+        if shouldShowVoiceControl {
+            ZStack {
+                micButtonView
+                    .opacity(hasText ? 0 : 1)
+                    .allowsHitTesting(!hasText)
+                sendButtonView(enabled: hasText)
+                    .opacity(hasText ? 1 : 0)
+                    .allowsHitTesting(hasText)
+            }
+            .frame(width: 36, height: 36)
+        } else {
+            sendButtonView(enabled: hasText)
+                .frame(width: 36, height: 36)
+        }
+    }
+
+    private var micButtonView: some View {
+        let tint = (isRecordingVoiceNote || isPreparingVoiceNote) ? Color.red : composerAccentColor
+
+        return Image(systemName: "mic.circle.fill")
+            .font(.bitchatSystem(size: 24))
+            .foregroundColor(tint)
+            .frame(width: 36, height: 36)
+            .contentShape(Circle())
+            .overlay(
+                Color.clear
+                    .contentShape(Circle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in startVoiceRecording() }
+                            .onEnded { _ in finishVoiceRecording(send: true) }
+                    )
+            )
+            .accessibilityLabel("Hold to record a voice note")
+    }
+
+    private func sendButtonView(enabled: Bool) -> some View {
+        let activeColor = composerAccentColor
+        return Button(action: sendMessage) {
+            Image(systemName: "arrow.up.circle.fill")
+                .font(.bitchatSystem(size: 24))
+                .foregroundColor(enabled ? activeColor : Color.gray)
+                .frame(width: 36, height: 36)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .accessibilityLabel(
+            String(localized: "content.accessibility.send_message", comment: "Accessibility label for the send message button")
+        )
+        .accessibilityHint(
+            enabled
+            ? String(localized: "content.accessibility.send_hint_ready", comment: "Hint prompting the user to send the message")
+            : String(localized: "content.accessibility.send_hint_empty", comment: "Hint prompting the user to enter a message")
+        )
+    }
+
+    func formattedRecordingDuration() -> String {
+        let clamped = max(0, recordingDuration)
+        let totalMilliseconds = Int((clamped * 1000).rounded())
+        let minutes = totalMilliseconds / 60_000
+        let seconds = (totalMilliseconds % 60_000) / 1_000
+        let centiseconds = (totalMilliseconds % 1_000) / 10
+        return String(format: "%02d:%02d.%02d", minutes, seconds, centiseconds)
+    }
+
+    func startVoiceRecording() {
+        guard shouldShowVoiceControl else { return }
+        guard !isRecordingVoiceNote && !isPreparingVoiceNote else { return }
+        isPreparingVoiceNote = true
+        Task { @MainActor in
+            let granted = await VoiceRecorder.shared.requestPermission()
+            guard granted else {
+                isPreparingVoiceNote = false
+                recordingAlertMessage = "Microphone access is required to record voice notes."
+                showRecordingAlert = true
+                return
+            }
+            do {
+                _ = try VoiceRecorder.shared.startRecording()
+                recordingDuration = 0
+                recordingStartDate = Date()
+                recordingTimer?.invalidate()
+                recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+                    if let start = recordingStartDate {
+                        recordingDuration = Date().timeIntervalSince(start)
                     }
                 }
-                
-                // Add the match
-                let matchText = String(content[range])
-                segments.append((matchText, matchType))
-                
-                lastEnd = range.upperBound
+                if let timer = recordingTimer {
+                    RunLoop.main.add(timer, forMode: .common)
+                }
+                isPreparingVoiceNote = false
+                isRecordingVoiceNote = true
+            } catch {
+                SecureLogger.error("Voice recording failed to start: \(error)", category: .session)
+                recordingAlertMessage = "Could not start recording."
+                showRecordingAlert = true
+                VoiceRecorder.shared.cancelRecording()
+                isPreparingVoiceNote = false
+                isRecordingVoiceNote = false
+                recordingStartDate = nil
             }
         }
-        
-        // Add any remaining text
-        if lastEnd < content.endIndex {
-            let remainingText = String(content[lastEnd...])
-            if !remainingText.isEmpty {
-                segments.append((remainingText, "text"))
-            }
+    }
+
+    func finishVoiceRecording(send: Bool) {
+        if isPreparingVoiceNote {
+            isPreparingVoiceNote = false
+            VoiceRecorder.shared.cancelRecording()
+            return
         }
-        
-        return segments
+        guard isRecordingVoiceNote else { return }
+        isRecordingVoiceNote = false
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        if let start = recordingStartDate {
+            recordingDuration = Date().timeIntervalSince(start)
+        }
+        recordingStartDate = nil
+        if send {
+            let minimumDuration: TimeInterval = 1.0
+            VoiceRecorder.shared.stopRecording { url in
+                DispatchQueue.main.async {
+                    guard
+                        let url = url,
+                        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                        let fileSize = attributes[.size] as? NSNumber,
+                        fileSize.intValue > 0,
+                        recordingDuration >= minimumDuration
+                    else {
+                        if let url = url {
+                            try? FileManager.default.removeItem(at: url)
+                        }
+                        recordingAlertMessage = recordingDuration < minimumDuration
+                            ? "Recording is too short."
+                            : "Recording failed to save."
+                        showRecordingAlert = true
+                        return
+                    }
+                    viewModel.sendVoiceNote(at: url)
+                }
+            }
+        } else {
+            VoiceRecorder.shared.cancelRecording()
+        }
+    }
+
+    func cancelVoiceRecording() {
+        if isPreparingVoiceNote || isRecordingVoiceNote {
+            finishVoiceRecording(send: false)
+        }
+    }
+
+    func handleImportResult(_ result: Result<[URL], Error>, handler: @escaping (URL) async -> Void) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let needsStop = url.startAccessingSecurityScopedResource()
+            Task {
+                defer {
+                    if needsStop {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                await handler(url)
+            }
+        case .failure(let error):
+            SecureLogger.error("Media import failed: \(error)", category: .session)
+        }
+    }
+
+
+    func applicationFilesDirectory() -> URL? {
+        // Cache the directory lookup to avoid repeated FileManager calls during view rendering
+        struct Cache {
+            static var cachedURL: URL?
+            static var didAttempt = false
+        }
+
+        if Cache.didAttempt {
+            return Cache.cachedURL
+        }
+
+        do {
+            let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            let filesDir = base.appendingPathComponent("files", isDirectory: true)
+            try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true, attributes: nil)
+            Cache.cachedURL = filesDir
+            Cache.didAttempt = true
+            return filesDir
+        } catch {
+            SecureLogger.error("Failed to resolve application files directory: \(error)", category: .session)
+            Cache.didAttempt = true
+            return nil
+        }
     }
 }
 
-// Delivery status indicator view
-struct DeliveryStatusView: View {
-    let status: DeliveryStatus
-    let colorScheme: ColorScheme
-    
-    private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
-    }
-    
-    private var secondaryTextColor: Color {
-        colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
-    }
-    
+//
+
+struct ImagePreviewView: View {
+    let url: URL
+
+    @Environment(\.dismiss) private var dismiss
+    #if os(iOS)
+    @State private var showExporter = false
+    @State private var platformImage: UIImage?
+    #else
+    @State private var platformImage: NSImage?
+    #endif
+
     var body: some View {
-        switch status {
-        case .sending:
-            Image(systemName: "circle")
-                .font(.system(size: 10))
-                .foregroundColor(secondaryTextColor.opacity(0.6))
-            
-        case .sent:
-            Image(systemName: "checkmark")
-                .font(.system(size: 10))
-                .foregroundColor(secondaryTextColor.opacity(0.6))
-            
-        case .delivered(let nickname, _):
-            HStack(spacing: -2) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack {
+                Spacer()
+                if let image = platformImage {
+                    #if os(iOS)
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding()
+                    #else
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding()
+                    #endif
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(.white)
+                }
+                Spacer()
+                HStack {
+                    Button(action: { dismiss() }) {
+                        Text("close", comment: "Button to dismiss fullscreen media viewer")
+                            .font(.bitchatSystem(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.5), lineWidth: 1))
+                    }
+                    Spacer()
+                    Button(action: saveCopy) {
+                        Text("save", comment: "Button to save media to device")
+                            .font(.bitchatSystem(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(Color.blue.opacity(0.6)))
+                    }
+                }
+                .padding([.horizontal, .bottom], 24)
             }
-            .foregroundColor(textColor.opacity(0.8))
-            .help("Delivered to \(nickname)")
-            
-        case .read(let nickname, _):
-            HStack(spacing: -2) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .bold))
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .bold))
+        }
+        .onAppear(perform: loadImage)
+        #if os(iOS)
+        .sheet(isPresented: $showExporter) {
+            FileExportWrapper(url: url)
+        }
+        #endif
+    }
+
+    private func loadImage() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            #if os(iOS)
+            guard let image = UIImage(contentsOfFile: url.path) else { return }
+            #else
+            guard let image = NSImage(contentsOf: url) else { return }
+            #endif
+            DispatchQueue.main.async {
+                self.platformImage = image
             }
-            .foregroundColor(Color(red: 0.0, green: 0.478, blue: 1.0))  // Bright blue
-            .help("Read by \(nickname)")
-            
-        case .failed(let reason):
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 10))
-                .foregroundColor(Color.red.opacity(0.8))
-                .help("Failed: \(reason)")
-            
-        case .partiallyDelivered(let reached, let total):
-            HStack(spacing: 1) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
-                Text("\(reached)/\(total)")
-                    .font(.system(size: 10, design: .monospaced))
+        }
+    }
+
+    private func saveCopy() {
+        #if os(iOS)
+        showExporter = true
+        #else
+        Task { @MainActor in
+            let panel = NSSavePanel()
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = url.lastPathComponent
+            panel.prompt = "save"
+            if panel.runModal() == .OK, let destination = panel.url {
+                do {
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        try FileManager.default.removeItem(at: destination)
+                    }
+                    try FileManager.default.copyItem(at: url, to: destination)
+                } catch {
+                    SecureLogger.error("Failed to save image preview copy: \(error)", category: .session)
+                }
             }
-            .foregroundColor(secondaryTextColor.opacity(0.6))
-            .help("Delivered to \(reached) of \(total) members")
+        }
+        #endif
+    }
+
+    #if os(iOS)
+    private struct FileExportWrapper: UIViewControllerRepresentable {
+        let url: URL
+
+        func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+            let controller = UIDocumentPickerViewController(forExporting: [url])
+            controller.shouldShowFileExtensions = true
+            return controller
+        }
+
+        func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+    }
+#endif
+}
+
+#if os(iOS)
+// MARK: - Image Picker (Camera or Photo Library)
+struct ImagePickerView: UIViewControllerRepresentable {
+    let sourceType: UIImagePickerController.SourceType
+    let completion: (UIImage?) -> Void
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = sourceType
+        picker.delegate = context.coordinator
+        picker.allowsEditing = false
+
+        // Use standard full screen - iOS handles safe areas automatically
+        picker.modalPresentationStyle = .fullScreen
+
+        // Force dark mode to make safe area bars black instead of white
+        picker.overrideUserInterfaceStyle = .dark
+
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(completion: completion)
+    }
+
+    class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let completion: (UIImage?) -> Void
+
+        init(completion: @escaping (UIImage?) -> Void) {
+            self.completion = completion
+        }
+
+        func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            let image = info[.originalImage] as? UIImage
+            completion(image)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            completion(nil)
         }
     }
 }
+#endif
+
+#if os(macOS)
+// MARK: - macOS Image Picker
+struct MacImagePickerView: View {
+    let completion: (URL?) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Choose an image")
+                .font(.headline)
+
+            Button("Select Image") {
+                let panel = NSOpenPanel()
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = false
+                panel.canChooseFiles = true
+                panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
+                panel.message = "Choose an image to send"
+
+                if panel.runModal() == .OK {
+                    completion(panel.url)
+                } else {
+                    dismiss()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button("Cancel") {
+                completion(nil)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(40)
+        .frame(minWidth: 300, minHeight: 150)
+    }
+}
+#endif

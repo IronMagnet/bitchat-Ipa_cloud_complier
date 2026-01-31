@@ -6,15 +6,88 @@
 // For more information, see <https://unlicense.org>
 //
 
+///
+/// # NoiseProtocol
+///
+/// A complete implementation of the Noise Protocol Framework for end-to-end
+/// encryption in BitChat. This file contains the core cryptographic primitives
+/// and handshake logic that enable secure communication between peers.
+///
+/// ## Overview
+/// The Noise Protocol Framework is a modern cryptographic framework designed
+/// for building secure protocols. BitChat uses Noise to provide:
+/// - Mutual authentication between peers
+/// - Forward secrecy for all messages
+/// - Protection against replay attacks
+/// - Minimal round trips for connection establishment
+///
+/// ## Implementation Details
+/// This implementation follows the Noise specification exactly, using:
+/// - **Pattern**: XX (most versatile, provides mutual authentication)
+/// - **DH**: Curve25519 (X25519 key exchange)
+/// - **Cipher**: ChaCha20-Poly1305 (AEAD encryption)
+/// - **Hash**: SHA-256 (for key derivation and authentication)
+///
+/// ## Security Properties
+/// The XX handshake pattern provides:
+/// 1. **Identity Hiding**: Both parties' identities are encrypted
+/// 2. **Forward Secrecy**: Past sessions remain secure if keys are compromised
+/// 3. **Key Compromise Impersonation Resistance**: Compromised static key doesn't allow impersonation to that party
+/// 4. **Mutual Authentication**: Both parties verify each other's identity
+///
+/// ## Handshake Flow (XX Pattern)
+/// ```
+/// Initiator                              Responder
+/// ---------                              ---------
+/// -> e                                   (ephemeral key)
+/// <- e, ee, s, es                       (ephemeral, DH, static encrypted, DH)
+/// -> s, se                              (static encrypted, DH)
+/// ```
+///
+/// ## Key Components
+/// - **NoiseCipherState**: Manages symmetric encryption with nonce tracking
+/// - **NoiseSymmetricState**: Handles key derivation and handshake hashing
+/// - **NoiseHandshakeState**: Orchestrates the complete handshake process
+///
+/// ## Replay Protection
+/// Implements sliding window replay protection to prevent message replay attacks:
+/// - Tracks nonces within a 1024-message window
+/// - Rejects duplicate or too-old nonces
+/// - Handles out-of-order message delivery
+///
+/// ## Usage Example
+/// ```swift
+/// let handshake = NoiseHandshakeState(
+///     pattern: .XX,
+///     role: .initiator,
+///     localStatic: staticKeyPair
+/// )
+/// let messageBuffer = handshake.writeMessage(payload: Data())
+/// // Send messageBuffer to peer...
+/// ```
+///
+/// ## Security Considerations
+/// - Static keys must be generated using secure random sources
+/// - Keys should be stored securely (e.g., in Keychain)
+/// - Handshake state must not be reused after completion
+/// - Transport messages have a nonce limit (2^64-1)
+///
+/// ## References
+/// - Noise Protocol Framework: http://www.noiseprotocol.org/
+/// - Noise Specification: http://www.noiseprotocol.org/noise.html
+///
+
+import BitLogger
 import Foundation
 import CryptoKit
-import os.log
 
 // Core Noise Protocol implementation
 // Based on the Noise Protocol Framework specification
 
 // MARK: - Constants and Types
 
+/// Supported Noise handshake patterns.
+/// Each pattern provides different security properties and authentication guarantees.
 enum NoisePattern {
     case XX  // Most versatile, mutual authentication
     case IK  // Initiator knows responder's static key
@@ -50,14 +123,34 @@ struct NoiseProtocolName {
 
 // MARK: - Cipher State
 
-class NoiseCipherState {
+/// Manages symmetric encryption state for Noise protocol sessions.
+/// Handles ChaCha20-Poly1305 AEAD encryption with automatic nonce management
+/// and replay protection using a sliding window algorithm.
+/// - Warning: Nonce reuse would be catastrophic for security
+final class NoiseCipherState {
+    // Constants for replay protection
+    private static let NONCE_SIZE_BYTES = 4
+    private static let REPLAY_WINDOW_SIZE = 1024
+    private static let REPLAY_WINDOW_BYTES = REPLAY_WINDOW_SIZE / 8 // 128 bytes
+    private static let HIGH_NONCE_WARNING_THRESHOLD: UInt64 = 1_000_000_000
+    
     private var key: SymmetricKey?
     private var nonce: UInt64 = 0
+    private var useExtractedNonce: Bool = false
+    
+    // Sliding window replay protection (only used when useExtractedNonce = true)
+    private var highestReceivedNonce: UInt64 = 0
+    private var replayWindow: [UInt8] = Array(repeating: 0, count: REPLAY_WINDOW_BYTES)
     
     init() {}
     
-    init(key: SymmetricKey) {
+    init(key: SymmetricKey, useExtractedNonce: Bool = false) {
         self.key = key
+        self.useExtractedNonce = useExtractedNonce
+    }
+    
+    deinit {
+        clearSensitiveData()
     }
     
     func initializeKey(_ key: SymmetricKey) {
@@ -69,6 +162,99 @@ class NoiseCipherState {
         return key != nil
     }
     
+    // MARK: - Sliding Window Replay Protection
+    
+    /// Check if nonce is valid for replay protection
+    /// BCH-01-010: Use safe arithmetic to prevent integer overflow
+    private func isValidNonce(_ receivedNonce: UInt64) -> Bool {
+        // Safe overflow check: instead of (receivedNonce + WINDOW_SIZE <= highest)
+        // use (highest >= WINDOW_SIZE && receivedNonce <= highest - WINDOW_SIZE)
+        let windowSize = UInt64(Self.REPLAY_WINDOW_SIZE)
+        if highestReceivedNonce >= windowSize && receivedNonce <= highestReceivedNonce - windowSize {
+            return false  // Too old, outside window
+        }
+
+        if receivedNonce > highestReceivedNonce {
+            return true  // Always accept newer nonces
+        }
+
+        let offset = Int(highestReceivedNonce - receivedNonce)
+        let byteIndex = offset / 8
+        let bitIndex = offset % 8
+
+        return (replayWindow[byteIndex] & (1 << bitIndex)) == 0  // Not yet seen
+    }
+    
+    /// Mark nonce as seen in replay window
+    private func markNonceAsSeen(_ receivedNonce: UInt64) {
+        if receivedNonce > highestReceivedNonce {
+            let shift = Int(receivedNonce - highestReceivedNonce)
+            
+            if shift >= Self.REPLAY_WINDOW_SIZE {
+                // Clear entire window - shift is too large
+                replayWindow = Array(repeating: 0, count: Self.REPLAY_WINDOW_BYTES)
+            } else {
+                // Shift window right by `shift` bits
+                for i in stride(from: Self.REPLAY_WINDOW_BYTES - 1, through: 0, by: -1) {
+                    let sourceByteIndex = i - shift / 8
+                    var newByte: UInt8 = 0
+                    
+                    if sourceByteIndex >= 0 {
+                        newByte = replayWindow[sourceByteIndex] >> (shift % 8)
+                        if sourceByteIndex > 0 && shift % 8 != 0 {
+                            newByte |= replayWindow[sourceByteIndex - 1] << (8 - shift % 8)
+                        }
+                    }
+                    
+                    replayWindow[i] = newByte
+                }
+            }
+            
+            highestReceivedNonce = receivedNonce
+            replayWindow[0] |= 1  // Mark most recent bit as seen
+        } else {
+            let offset = Int(highestReceivedNonce - receivedNonce)
+            let byteIndex = offset / 8
+            let bitIndex = offset % 8
+            replayWindow[byteIndex] |= (1 << bitIndex)
+        }
+    }
+    
+    /// Extract nonce from combined payload <nonce><ciphertext>
+    /// Returns tuple of (nonce, ciphertext) or nil if invalid
+    private func extractNonceFromCiphertextPayload(_ combinedPayload: Data) throws -> (nonce: UInt64, ciphertext: Data)? {
+        guard combinedPayload.count >= Self.NONCE_SIZE_BYTES else {
+            return nil
+        }
+        
+        // Extract 4-byte nonce (big-endian)
+        let nonceData = combinedPayload.prefix(Self.NONCE_SIZE_BYTES)
+        let extractedNonce = nonceData.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> UInt64 in
+            let byteArray = bytes.bindMemory(to: UInt8.self)
+            var result: UInt64 = 0
+            for i in 0..<Self.NONCE_SIZE_BYTES {
+                result = (result << 8) | UInt64(byteArray[i])
+            }
+            return result
+        }
+        
+        // Extract ciphertext (remaining bytes)
+        let ciphertext = combinedPayload.dropFirst(Self.NONCE_SIZE_BYTES)
+        
+        return (nonce: extractedNonce, ciphertext: Data(ciphertext))
+    }
+    
+    /// Convert nonce to 4-byte array (big-endian)
+    private func nonceToBytes(_ nonce: UInt64) -> Data {
+        var bytes = Data(count: Self.NONCE_SIZE_BYTES)
+        withUnsafeBytes(of: nonce.bigEndian) { ptr in
+            // Copy only the last 4 bytes from the 8-byte UInt64
+            let sourceBytes = ptr.bindMemory(to: UInt8.self)
+            bytes.replaceSubrange(0..<Self.NONCE_SIZE_BYTES, with: sourceBytes.suffix(Self.NONCE_SIZE_BYTES))
+        }
+        return bytes
+    }
+    
     func encrypt(plaintext: Data, associatedData: Data = Data()) throws -> Data {
         guard let key = self.key else {
             throw NoiseError.uninitializedCipher
@@ -77,20 +263,36 @@ class NoiseCipherState {
         // Debug logging for nonce tracking
         let currentNonce = nonce
         
+        // Check if nonce exceeds 4-byte limit (UInt32 max value)
+        guard nonce <= UInt64(UInt32.max) - 1 else {
+            throw NoiseError.nonceExceeded
+        }
+        
         // Create nonce from counter
         var nonceData = Data(count: 12)
-        withUnsafeBytes(of: nonce.littleEndian) { bytes in
+        withUnsafeBytes(of: currentNonce.littleEndian) { bytes in
             nonceData.replaceSubrange(4..<12, with: bytes)
         }
         
         let sealedBox = try ChaChaPoly.seal(plaintext, using: key, nonce: ChaChaPoly.Nonce(data: nonceData), authenticating: associatedData)
+        // increment local nonce
         nonce += 1
         
-        // Log high nonce values that might indicate issues
-        if currentNonce > 100 {
+        // Create combined payload: <nonce><ciphertext>
+        let combinedPayload: Data
+        if (useExtractedNonce) {
+            let nonceBytes = nonceToBytes(currentNonce)
+            combinedPayload = nonceBytes + sealedBox.ciphertext + sealedBox.tag
+        } else {
+            combinedPayload = sealedBox.ciphertext + sealedBox.tag
         }
         
-        return sealedBox.ciphertext + sealedBox.tag
+        // Log high nonce values that might indicate issues
+        if currentNonce > Self.HIGH_NONCE_WARNING_THRESHOLD {
+            SecureLogger.warning("High nonce value detected: \(currentNonce) - consider rekeying", category: .encryption)
+        }
+        
+        return combinedPayload
     }
     
     func decrypt(ciphertext: Data, associatedData: Data = Data()) throws -> Data {
@@ -102,16 +304,37 @@ class NoiseCipherState {
             throw NoiseError.invalidCiphertext
         }
         
-        // Debug logging for nonce tracking
-        let currentNonce = nonce
+        let encryptedData: Data
+        let tag: Data
+        let decryptionNonce: UInt64
         
-        // Split ciphertext and tag
-        let encryptedData = ciphertext.prefix(ciphertext.count - 16)
-        let tag = ciphertext.suffix(16)
+        if useExtractedNonce {
+            // Extract nonce and ciphertext from combined payload
+            guard let (extractedNonce, actualCiphertext) = try extractNonceFromCiphertextPayload(ciphertext) else {
+                SecureLogger.debug("Decrypt failed: Could not extract nonce from payload")
+                throw NoiseError.invalidCiphertext
+            }
+            
+            // Validate nonce with sliding window replay protection
+            guard isValidNonce(extractedNonce) else {
+                SecureLogger.debug("Replay attack detected: nonce \(extractedNonce) rejected")
+                throw NoiseError.replayDetected
+            }
+            
+            // Split ciphertext and tag
+            encryptedData = actualCiphertext.prefix(actualCiphertext.count - 16)
+            tag = actualCiphertext.suffix(16)
+            decryptionNonce = extractedNonce
+        } else {
+            // Split ciphertext and tag
+            encryptedData = ciphertext.prefix(ciphertext.count - 16)
+            tag = ciphertext.suffix(16)
+            decryptionNonce = nonce
+        }
         
         // Create nonce from counter
         var nonceData = Data(count: 12)
-        withUnsafeBytes(of: nonce.littleEndian) { bytes in
+        withUnsafeBytes(of: decryptionNonce.littleEndian) { bytes in
             nonceData.replaceSubrange(4..<12, with: bytes)
         }
         
@@ -122,23 +345,54 @@ class NoiseCipherState {
         )
         
         // Log high nonce values that might indicate issues
-        if currentNonce > 100 {
+        if decryptionNonce > Self.HIGH_NONCE_WARNING_THRESHOLD {
+            SecureLogger.warning("High nonce value detected: \(decryptionNonce) - consider rekeying", category: .encryption)
         }
         
         do {
             let plaintext = try ChaChaPoly.open(sealedBox, using: key, authenticating: associatedData)
+
+            // BCH-01-010: Atomic nonce state update
+            // Both replay window marking and nonce increment must complete together
+            // to prevent state desynchronization. We perform both after successful
+            // decryption only, ensuring state consistency on any failure path.
+            if useExtractedNonce {
+                markNonceAsSeen(decryptionNonce)
+            }
             nonce += 1
+
             return plaintext
         } catch {
-            // Log authentication failures with nonce info
+            // Decryption failed - nonce state remains unchanged (atomic rollback)
+            SecureLogger.debug("Decrypt failed: \(error) for nonce \(decryptionNonce)")
+            SecureLogger.error("Decryption failed at nonce \(decryptionNonce)", category: .encryption)
             throw error
+        }
+    }
+    
+    /// Securely clear sensitive cryptographic data from memory
+    func clearSensitiveData() {
+        // Clear the symmetric key
+        key = nil
+        
+        // Reset nonce
+        nonce = 0
+        highestReceivedNonce = 0
+        
+        // Clear replay window
+        for i in 0..<replayWindow.count {
+            replayWindow[i] = 0
         }
     }
 }
 
 // MARK: - Symmetric State
 
-class NoiseSymmetricState {
+/// Manages the symmetric cryptographic state during Noise handshakes.
+/// Responsible for key derivation, protocol name hashing, and maintaining
+/// the chaining key that provides key separation between handshake messages.
+/// - Note: This class implements the SymmetricState object from the Noise spec
+final class NoiseSymmetricState {
     private var cipherState: NoiseCipherState
     private var chainingKey: Data
     private var hash: Data
@@ -151,7 +405,7 @@ class NoiseSymmetricState {
         if nameData.count <= 32 {
             self.hash = nameData + Data(repeating: 0, count: 32 - nameData.count)
         } else {
-            self.hash = Data(SHA256.hash(data: nameData))
+            self.hash = nameData.sha256Hash()
         }
         self.chainingKey = self.hash
     }
@@ -164,7 +418,7 @@ class NoiseSymmetricState {
     }
     
     func mixHash(_ data: Data) {
-        hash = Data(SHA256.hash(data: hash + data))
+        hash = (hash + data).sha256Hash()
     }
     
     func mixKeyAndHash(_ inputKeyMaterial: Data) {
@@ -205,17 +459,40 @@ class NoiseSymmetricState {
         }
     }
     
-    func split() -> (NoiseCipherState, NoiseCipherState) {
+    func split(useExtractedNonce: Bool) -> (NoiseCipherState, NoiseCipherState) {
         let output = hkdf(chainingKey: chainingKey, inputKeyMaterial: Data(), numOutputs: 2)
         let tempKey1 = SymmetricKey(data: output[0])
         let tempKey2 = SymmetricKey(data: output[1])
-        
-        let c1 = NoiseCipherState(key: tempKey1)
-        let c2 = NoiseCipherState(key: tempKey2)
-        
+
+        let c1 = NoiseCipherState(key: tempKey1, useExtractedNonce: useExtractedNonce)
+        let c2 = NoiseCipherState(key: tempKey2, useExtractedNonce: useExtractedNonce)
+
+        // BCH-01-010: Clear symmetric state after split per Noise spec
+        // The chaining key and hash should not be retained after handshake completes
+        clearSensitiveData()
+
         return (c1, c2)
     }
-    
+
+    /// BCH-01-010: Securely clear sensitive cryptographic state
+    /// Called after split() to clear chaining key and hash per Noise spec
+    func clearSensitiveData() {
+        // Clear chaining key by overwriting with zeros
+        let chainingKeyCount = chainingKey.count
+        chainingKey = Data(repeating: 0, count: chainingKeyCount)
+
+        // Clear hash by overwriting with zeros
+        let hashCount = hash.count
+        hash = Data(repeating: 0, count: hashCount)
+
+        // Clear the internal cipher state
+        cipherState.clearSensitiveData()
+    }
+
+    deinit {
+        clearSensitiveData()
+    }
+
     // HKDF implementation
     private func hkdf(chainingKey: Data, inputKeyMaterial: Data, numOutputs: Int) -> [Data] {
         let tempKey = HMAC<SHA256>.authenticationCode(for: inputKeyMaterial, using: SymmetricKey(data: chainingKey))
@@ -238,9 +515,14 @@ class NoiseSymmetricState {
 
 // MARK: - Handshake State
 
-class NoiseHandshakeState {
+/// Orchestrates the complete Noise handshake process.
+/// This is the main interface for establishing encrypted sessions between peers.
+/// Manages the handshake state machine, message patterns, and key derivation.
+/// - Important: Each handshake instance should only be used once
+final class NoiseHandshakeState {
     private let role: NoiseRole
     private let pattern: NoisePattern
+    private let keychain: KeychainManagerProtocol
     private var symmetricState: NoiseSymmetricState
     
     // Keys
@@ -256,9 +538,24 @@ class NoiseHandshakeState {
     private var messagePatterns: [[NoiseMessagePattern]] = []
     private var currentPattern = 0
     
-    init(role: NoiseRole, pattern: NoisePattern, localStaticKey: Curve25519.KeyAgreement.PrivateKey? = nil, remoteStaticKey: Curve25519.KeyAgreement.PublicKey? = nil) {
+    // Test support: predetermined ephemeral keys for test vectors
+    private var predeterminedEphemeralKey: Curve25519.KeyAgreement.PrivateKey?
+    private var prologueData: Data
+    
+    init(
+        role: NoiseRole,
+        pattern: NoisePattern,
+        keychain: KeychainManagerProtocol,
+        localStaticKey: Curve25519.KeyAgreement.PrivateKey? = nil,
+        remoteStaticKey: Curve25519.KeyAgreement.PublicKey? = nil,
+        prologue: Data = Data(),
+        predeterminedEphemeralKey: Curve25519.KeyAgreement.PrivateKey? = nil
+    ) {
         self.role = role
         self.pattern = pattern
+        self.keychain = keychain
+        self.prologueData = prologue
+        self.predeterminedEphemeralKey = predeterminedEphemeralKey
         
         // Initialize static keys
         if let localKey = localStaticKey {
@@ -279,6 +576,8 @@ class NoiseHandshakeState {
     }
     
     private func mixPreMessageKeys() {
+        // Mix prologue
+        symmetricState.mixHash(self.prologueData)
         // For XX pattern, no pre-message keys
         // For IK/NK patterns, we'd mix the responder's static key here
         switch pattern {
@@ -286,6 +585,7 @@ class NoiseHandshakeState {
             break // No pre-message keys
         case .IK, .NK:
             if role == .initiator, let remoteStatic = remoteStaticPublic {
+                _ = symmetricState.getHandshakeHash()
                 symmetricState.mixHash(remoteStatic.rawRepresentation)
             }
         }
@@ -296,15 +596,19 @@ class NoiseHandshakeState {
             throw NoiseError.handshakeComplete
         }
         
-        
         var messageBuffer = Data()
         let patterns = messagePatterns[currentPattern]
         
         for pattern in patterns {
             switch pattern {
             case .e:
-                // Generate ephemeral key
-                localEphemeralPrivate = Curve25519.KeyAgreement.PrivateKey()
+                // Generate ephemeral key (or use predetermined key for tests)
+                if let predetermined = predeterminedEphemeralKey {
+                    localEphemeralPrivate = predetermined
+                    predeterminedEphemeralKey = nil
+                } else {
+                    localEphemeralPrivate = Curve25519.KeyAgreement.PrivateKey()
+                }
                 localEphemeralPublic = localEphemeralPrivate!.publicKey
                 messageBuffer.append(localEphemeralPublic!.rawRepresentation)
                 symmetricState.mixHash(localEphemeralPublic!.rawRepresentation)
@@ -324,7 +628,10 @@ class NoiseHandshakeState {
                     throw NoiseError.missingKeys
                 }
                 let shared = try localEphemeral.sharedSecretFromKeyAgreement(with: remoteEphemeral)
-                symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                var sharedData = shared.withUnsafeBytes { Data($0) }
+                symmetricState.mixKey(sharedData)
+                // Clear sensitive shared secret
+                keychain.secureClear(&sharedData)
                 
             case .es:
                 // DH(ephemeral, static) - direction depends on role
@@ -334,14 +641,20 @@ class NoiseHandshakeState {
                         throw NoiseError.missingKeys
                     }
                     let shared = try localEphemeral.sharedSecretFromKeyAgreement(with: remoteStatic)
-                    symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                    var sharedData = shared.withUnsafeBytes { Data($0) }
+                    symmetricState.mixKey(sharedData)
+                    // Clear sensitive shared secret
+                    keychain.secureClear(&sharedData)
                 } else {
                     guard let localStatic = localStaticPrivate,
                           let remoteEphemeral = remoteEphemeralPublic else {
                         throw NoiseError.missingKeys
                     }
                     let shared = try localStatic.sharedSecretFromKeyAgreement(with: remoteEphemeral)
-                    symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                    var sharedData = shared.withUnsafeBytes { Data($0) }
+                    symmetricState.mixKey(sharedData)
+                    // Clear sensitive shared secret
+                    keychain.secureClear(&sharedData)
                 }
                 
             case .se:
@@ -352,14 +665,20 @@ class NoiseHandshakeState {
                         throw NoiseError.missingKeys
                     }
                     let shared = try localStatic.sharedSecretFromKeyAgreement(with: remoteEphemeral)
-                    symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                    var sharedData = shared.withUnsafeBytes { Data($0) }
+                    symmetricState.mixKey(sharedData)
+                    // Clear sensitive shared secret
+                    keychain.secureClear(&sharedData)
                 } else {
                     guard let localEphemeral = localEphemeralPrivate,
                           let remoteStatic = remoteStaticPublic else {
                         throw NoiseError.missingKeys
                     }
                     let shared = try localEphemeral.sharedSecretFromKeyAgreement(with: remoteStatic)
-                    symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                    var sharedData = shared.withUnsafeBytes { Data($0) }
+                    symmetricState.mixKey(sharedData)
+                    // Clear sensitive shared secret
+                    keychain.secureClear(&sharedData)
                 }
                 
             case .ss:
@@ -369,7 +688,10 @@ class NoiseHandshakeState {
                     throw NoiseError.missingKeys
                 }
                 let shared = try localStatic.sharedSecretFromKeyAgreement(with: remoteStatic)
-                symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                var sharedData = shared.withUnsafeBytes { Data($0) }
+                symmetricState.mixKey(sharedData)
+                // Clear sensitive shared secret
+                keychain.secureClear(&sharedData)
             }
         }
         
@@ -387,7 +709,6 @@ class NoiseHandshakeState {
             throw NoiseError.handshakeComplete
         }
         
-        
         var buffer = message
         let patterns = messagePatterns[currentPattern]
         
@@ -404,6 +725,7 @@ class NoiseHandshakeState {
                 do {
                     remoteEphemeralPublic = try NoiseHandshakeState.validatePublicKey(ephemeralData)
                 } catch {
+                    SecureLogger.warning("Invalid ephemeral public key received", category: .security)
                     throw NoiseError.invalidMessage
                 }
                 symmetricState.mixHash(ephemeralData)
@@ -420,6 +742,7 @@ class NoiseHandshakeState {
                     let decrypted = try symmetricState.decryptAndHash(staticData)
                     remoteStaticPublic = try NoiseHandshakeState.validatePublicKey(decrypted)
                 } catch {
+                    SecureLogger.error(.authenticationFailed(peerID: "Unknown - handshake"))
                     throw NoiseError.authenticationFailure
                 }
                 
@@ -444,8 +767,11 @@ class NoiseHandshakeState {
                 throw NoiseError.missingKeys
             }
             let shared = try localEphemeral.sharedSecretFromKeyAgreement(with: remoteEphemeral)
-            symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
-            
+            var sharedData = shared.withUnsafeBytes { Data($0) }
+            symmetricState.mixKey(sharedData)
+            // Clear sensitive shared secret
+            keychain.secureClear(&sharedData)
+
         case .es:
             if role == .initiator {
                 guard let localEphemeral = localEphemeralPrivate,
@@ -453,14 +779,20 @@ class NoiseHandshakeState {
                     throw NoiseError.missingKeys
                 }
                 let shared = try localEphemeral.sharedSecretFromKeyAgreement(with: remoteStatic)
-                symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                var sharedData = shared.withUnsafeBytes { Data($0) }
+                symmetricState.mixKey(sharedData)
+                // Clear sensitive shared secret
+                keychain.secureClear(&sharedData)
             } else {
                 guard let localStatic = localStaticPrivate,
                       let remoteEphemeral = remoteEphemeralPublic else {
                     throw NoiseError.missingKeys
                 }
                 let shared = try localStatic.sharedSecretFromKeyAgreement(with: remoteEphemeral)
-                symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                var sharedData = shared.withUnsafeBytes { Data($0) }
+                symmetricState.mixKey(sharedData)
+                // Clear sensitive shared secret
+                keychain.secureClear(&sharedData)
             }
             
         case .se:
@@ -470,14 +802,20 @@ class NoiseHandshakeState {
                     throw NoiseError.missingKeys
                 }
                 let shared = try localStatic.sharedSecretFromKeyAgreement(with: remoteEphemeral)
-                symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                var sharedData = shared.withUnsafeBytes { Data($0) }
+                symmetricState.mixKey(sharedData)
+                // Clear sensitive shared secret
+                keychain.secureClear(&sharedData)
             } else {
                 guard let localEphemeral = localEphemeralPrivate,
                       let remoteStatic = remoteStaticPublic else {
                     throw NoiseError.missingKeys
                 }
                 let shared = try localEphemeral.sharedSecretFromKeyAgreement(with: remoteStatic)
-                symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
+                var sharedData = shared.withUnsafeBytes { Data($0) }
+                symmetricState.mixKey(sharedData)
+                // Clear sensitive shared secret
+                keychain.secureClear(&sharedData)
             }
             
         case .ss:
@@ -486,9 +824,12 @@ class NoiseHandshakeState {
                 throw NoiseError.missingKeys
             }
             let shared = try localStatic.sharedSecretFromKeyAgreement(with: remoteStatic)
-            symmetricState.mixKey(shared.withUnsafeBytes { Data($0) })
-            
-        default:
+            var sharedData = shared.withUnsafeBytes { Data($0) }
+            symmetricState.mixKey(sharedData)
+            // Clear sensitive shared secret
+            keychain.secureClear(&sharedData)
+
+        case .e, .s:
             break
         }
     }
@@ -497,16 +838,20 @@ class NoiseHandshakeState {
         return currentPattern >= messagePatterns.count
     }
     
-    func getTransportCiphers() throws -> (send: NoiseCipherState, receive: NoiseCipherState) {
+    func getTransportCiphers(useExtractedNonce: Bool) throws -> (send: NoiseCipherState, receive: NoiseCipherState, handshakeHash: Data) {
         guard isHandshakeComplete() else {
             throw NoiseError.handshakeNotComplete
         }
-        
-        let (c1, c2) = symmetricState.split()
-        
+
+        // BCH-01-010: Capture handshake hash BEFORE split() clears symmetric state
+        let finalHandshakeHash = symmetricState.getHandshakeHash()
+
+        let (c1, c2) = symmetricState.split(useExtractedNonce: useExtractedNonce)
+
         // Initiator uses c1 for sending, c2 for receiving
         // Responder uses c2 for sending, c1 for receiving
-        return role == .initiator ? (c1, c2) : (c2, c1)
+        let ciphers = role == .initiator ? (c1, c2) : (c2, c1)
+        return (send: ciphers.0, receive: ciphers.1, handshakeHash: finalHandshakeHash)
     }
     
     func getRemoteStaticPublicKey() -> Curve25519.KeyAgreement.PublicKey? {
@@ -563,6 +908,32 @@ enum NoiseError: Error {
     case invalidMessage
     case authenticationFailure
     case invalidPublicKey
+    case replayDetected
+    case nonceExceeded
+}
+
+// MARK: - Constant-Time Operations
+
+/// BCH-01-010: Constant-time comparison to prevent timing side-channel attacks
+/// This function compares two Data objects in constant time, preventing
+/// information leakage via timing analysis.
+private func constantTimeCompare(_ a: Data, _ b: Data) -> Bool {
+    guard a.count == b.count else { return false }
+
+    var result: UInt8 = 0
+    for i in 0..<a.count {
+        result |= a[a.startIndex.advanced(by: i)] ^ b[b.startIndex.advanced(by: i)]
+    }
+    return result == 0
+}
+
+/// BCH-01-010: Constant-time check if all bytes are zero
+private func constantTimeIsZero(_ data: Data) -> Bool {
+    var result: UInt8 = 0
+    for byte in data {
+        result |= byte
+    }
+    return result == 0
 }
 
 // MARK: - Key Validation
@@ -570,24 +941,25 @@ enum NoiseError: Error {
 extension NoiseHandshakeState {
     /// Validate a Curve25519 public key
     /// Checks for weak/invalid keys that could compromise security
+    /// BCH-01-010: Uses constant-time operations to prevent timing side-channels
     static func validatePublicKey(_ keyData: Data) throws -> Curve25519.KeyAgreement.PublicKey {
         // Check key length
         guard keyData.count == 32 else {
             throw NoiseError.invalidPublicKey
         }
-        
-        // Check for all-zero key (point at infinity)
-        if keyData.allSatisfy({ $0 == 0 }) {
+
+        // BCH-01-010: Constant-time check for all-zero key (point at infinity)
+        if constantTimeIsZero(keyData) {
             throw NoiseError.invalidPublicKey
         }
-        
+
         // Check for low-order points that could enable small subgroup attacks
         // These are the known bad points for Curve25519
         let lowOrderPoints: [Data] = [
             Data(repeating: 0x00, count: 32), // Already checked above
             Data([0x01] + Data(repeating: 0x00, count: 31)), // Point of order 1
             Data([0x00] + Data(repeating: 0x00, count: 30) + [0x01]), // Another low-order point
-            Data([0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 
+            Data([0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3,
                   0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32,
                   0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00]), // Low order point
             Data([0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1,
@@ -601,19 +973,28 @@ extension NoiseHandshakeState {
                   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])  // Another bad point
         ]
-        
-        // Check against known bad points
-        if lowOrderPoints.contains(keyData) {
-            SecurityLogger.logSecurityEvent(.invalidKey(reason: "Low-order point detected"), level: .warning)
+
+        // BCH-01-010: Constant-time check against known bad points
+        // We check all points and accumulate matches to avoid early exit timing leaks
+        var foundBadPoint = false
+        for badPoint in lowOrderPoints {
+            if constantTimeCompare(keyData, badPoint) {
+                foundBadPoint = true
+            }
+        }
+
+        if foundBadPoint {
+            SecureLogger.warning("Low-order point detected", category: .security)
             throw NoiseError.invalidPublicKey
         }
-        
+
         // Try to create the key - CryptoKit will validate curve points internally
         do {
             let publicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: keyData)
             return publicKey
         } catch {
             // If CryptoKit rejects it, it's invalid
+            SecureLogger.warning("CryptoKit validation failed", category: .security)
             throw NoiseError.invalidPublicKey
         }
     }

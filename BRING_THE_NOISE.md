@@ -37,7 +37,7 @@ This three-message pattern provides:
 #### NoiseEncryptionService
 The main service managing all Noise operations:
 ```swift
-class NoiseEncryptionService {
+final class NoiseEncryptionService {
     private let staticIdentityKey: Curve25519.KeyAgreement.PrivateKey
     private let sessionManager: NoiseSessionManager
     private let channelEncryption = NoiseChannelEncryption()
@@ -47,7 +47,7 @@ class NoiseEncryptionService {
 #### NoiseSession
 Individual session state for each peer:
 ```swift
-class NoiseSession {
+final class NoiseSession {
     private var handshakeState: NoiseHandshakeState?
     private var sendCipher: NoiseCipherState?
     private var receiveCipher: NoiseCipherState?
@@ -58,7 +58,7 @@ class NoiseSession {
 #### NoiseSessionManager
 Thread-safe session management:
 ```swift
-class NoiseSessionManager {
+final class NoiseSessionManager {
     private var sessions: [String: NoiseSession] = [:]
     private let sessionsQueue = DispatchQueue(label: "noise.sessions", attributes: .concurrent)
 }
@@ -128,16 +128,6 @@ let encrypted = try noiseService.encrypt(messageData, for: peerID)
 let decrypted = try noiseService.decrypt(encryptedData, from: peerID)
 ```
 
-### Channel Encryption
-
-Password-protected channels use Noise for key distribution:
-
-```swift
-// Share channel key securely
-let keyPacket = createChannelKeyPacket(password: password, channel: channel)
-let encrypted = try encrypt(keyPacket, for: peerID)
-```
-
 ## Security Properties
 
 ### Forward Secrecy
@@ -156,15 +146,6 @@ let encrypted = try encrypt(keyPacket, for: peerID)
 - No persistent session identifiers
 
 ## Implementation Details
-
-### Key Derivation
-```swift
-// HKDF for key derivation
-func hkdf(salt: Data, ikm: Data, info: Data, length: Int) -> Data
-
-// Derive channel keys with PBKDF2
-func deriveChannelKey(password: String, salt: Data) -> SymmetricKey
-```
 
 ### Cryptographic Primitives
 - **DH**: X25519 (Curve25519)

@@ -14,73 +14,95 @@ import UIKit
 import AppKit
 #endif
 
-class NotificationService {
+final class NotificationService {
     static let shared = NotificationService()
-    
+
+    /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
+    private var isRunningTests: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return NSClassFromString("XCTestCase") != nil ||
+               env["XCTestConfigurationFilePath"] != nil ||
+               env["XCTestBundlePath"] != nil ||
+               env["GITHUB_ACTIONS"] != nil ||
+               env["CI"] != nil
+    }
+
     private init() {}
-    
+
     func requestAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+        guard !isRunningTests else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             if granted {
                 // Permission granted
+            } else {
+                // Permission denied
             }
         }
     }
     
-    func sendLocalNotification(title: String, body: String, identifier: String) {
-        // Check if app is in foreground
-        #if os(iOS)
-        guard UIApplication.shared.applicationState != .active else {
-            // App is active/foreground, skipping notification
-            return
-        }
-        // App state checked, sending notification
-        #elseif os(macOS)
-        // On macOS, check if app is active
-        guard !NSApplication.shared.isActive else {
-            // App is active/foreground, skipping notification
-            return
-        }
-        // App is not active, sending notification
-        #endif
-        
+    func sendLocalNotification(
+        title: String,
+        body: String,
+        identifier: String,
+        userInfo: [String: Any]? = nil,
+        interruptionLevel: UNNotificationInterruptionLevel = .active
+    ) {
+        guard !isRunningTests else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        
+        content.interruptionLevel = interruptionLevel
+
+        if let userInfo = userInfo {
+            content.userInfo = userInfo
+        }
+
         let request = UNNotificationRequest(
             identifier: identifier,
             content: content,
             trigger: nil // Deliver immediately
         )
-        
-        UNUserNotificationCenter.current().add(request) { _ in
-            // Notification added
-        }
+
+        UNUserNotificationCenter.current().add(request)
     }
     
     func sendMentionNotification(from sender: String, message: String) {
-        let title = "＠🫵 you were mentioned by \(sender)"
+        let title = "🫵 you were mentioned by \(sender)"
         let body = message
         let identifier = "mention-\(UUID().uuidString)"
         
         sendLocalNotification(title: title, body: body, identifier: identifier)
     }
     
-    func sendPrivateMessageNotification(from sender: String, message: String) {
-        let title = "🔒 private message from \(sender)"
+    func sendPrivateMessageNotification(from sender: String, message: String, peerID: PeerID) {
+        let title = "🔒 DM from \(sender)"
         let body = message
         let identifier = "private-\(UUID().uuidString)"
+        let userInfo = ["peerID": peerID.id, "senderName": sender]
         
-        sendLocalNotification(title: title, body: body, identifier: identifier)
+        sendLocalNotification(title: title, body: body, identifier: identifier, userInfo: userInfo)
     }
     
-    func sendFavoriteOnlineNotification(nickname: String) {
-        let title = "⭐ \(nickname) is online"
-        let body = "wanna get in there?"
-        let identifier = "favorite-online-\(UUID().uuidString)"
-        
-        sendLocalNotification(title: title, body: body, identifier: identifier)
+    // Geohash public chat notification with deep link to a specific geohash
+    func sendGeohashActivityNotification(geohash: String, titlePrefix: String = "#", bodyPreview: String) {
+        let title = "\(titlePrefix)\(geohash)"
+        let identifier = "geo-activity-\(geohash)-\(Date().timeIntervalSince1970)"
+        let deeplink = "bitchat://geohash/\(geohash)"
+        let userInfo: [String: Any] = ["deeplink": deeplink]
+        sendLocalNotification(title: title, body: bodyPreview, identifier: identifier, userInfo: userInfo)
+    }
+
+    func sendNetworkAvailableNotification(peerCount: Int) {
+        let title = "👥 bitchatters nearby!"
+        let body = peerCount == 1 ? "1 person around" : "\(peerCount) people around"
+        let identifier = "network-available-\(Date().timeIntervalSince1970)"
+
+        sendLocalNotification(
+            title: title,
+            body: body,
+            identifier: identifier,
+            interruptionLevel: .timeSensitive
+        )
     }
 }
